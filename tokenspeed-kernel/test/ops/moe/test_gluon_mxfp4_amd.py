@@ -242,9 +242,12 @@ def test_bf16_activation_situ_moe() -> None:
     torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)
 
 
-def test_static_fp8_activation_moe() -> None:
+@pytest.mark.parametrize("decode", [False, True])
+def test_static_fp8_activation_moe(decode: bool) -> None:
     cdna4 = is_cdna4()
     if cdna4:
+        if decode:
+            pytest.skip("The gfx1250 decode kernel is unavailable on gfx950")
         hidden_size = 256
         intermediate_size = 256
         preprocess = preprocess_gluon_mxfp4_gfx950_moe_weights
@@ -342,6 +345,7 @@ def test_static_fp8_activation_moe() -> None:
             module.w2_weight_triton_tensor,
             w13_mx_scale=module.w13_precision_config.b_mx_scale,
             w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            decode=decode,
         )
 
     torch.cuda.synchronize()

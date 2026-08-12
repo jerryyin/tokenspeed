@@ -1140,6 +1140,13 @@ def _matmul(
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
 
 
+# The duplicate kernel still uses the prefill-only schedule classes above.
+# Import it here until decode specialization removes that dependency.
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (  # isort: skip
+    _matmul_decode,
+)
+
+
 def _can_overflow_int32(tensor: Any) -> bool:
     if tensor is None:
         return False
@@ -1256,6 +1263,7 @@ def matmul(
     schedule: str = "baseline",
     pingpong: bool = False,
     num_warps: int = 4,
+    decode: bool = False,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1272,6 +1280,7 @@ def matmul(
         precision_config: MX scale/output dtype configuration.
         x_global_scale: Optional scalar activation dequantization scale.
         fused_activation: Optional SwiGLU activation descriptor.
+        decode: Select the separately-defined duplicate kernel.
 
     Returns:
         ``(output, kernel)`` where ``kernel`` is the Triton/Gluon launch object.
@@ -1405,7 +1414,8 @@ def matmul(
                 [float(x_global_scale)], device=a.device, dtype=torch.float32
             )
 
-    kernel = _matmul[(grid,)](
+    target_kernel = _matmul_decode if decode else _matmul
+    kernel = target_kernel[(grid,)](
         c_storage.data,
         *out_matmul.stride(),
         x_global_scale,
@@ -1505,6 +1515,7 @@ def gluon_mxfp_dispatch_swiglu(
     out_quant_format: str | None = None,
     w_preshuffle: bool = False,
     x_scale_ragged_padded: bool = False,
+    decode: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch GEMM + fused SwiGLU using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1543,6 +1554,7 @@ def gluon_mxfp_dispatch_swiglu(
         num_warps=num_warps,
         num_buffers=num_buffers,
         w_transpose=w_transpose,
+        decode=decode,
     )
     return out
 
@@ -1576,6 +1588,7 @@ def gluon_mxfp_combine(
     num_ctas: int | None = None,
     w_preshuffle: bool = False,
     x_scale_ragged_padded: bool = False,
+    decode: bool = False,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1609,6 +1622,7 @@ def gluon_mxfp_combine(
         num_warps=num_warps,
         num_buffers=num_buffers,
         w_transpose=w_transpose,
+        decode=decode,
     )
     if n_expts_act is not None and int(n_expts_act) > 1:
         if n_tokens is None:
@@ -1725,6 +1739,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    decode: bool = False,
 ) -> torch.Tensor:
     """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
 
@@ -1743,6 +1758,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_alpha: SwiGLU gate scale.
         swiglu_limit: Optional SwiGLU clamp limit; ``0`` disables clamping.
         swiglu_beta: SwiGLU linear branch offset.
+        decode: Select the separately-defined duplicate kernel for both projections.
 
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
@@ -1802,6 +1818,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_warps=4,
         num_buffers=3,
         scale_load_mode="swizzle",
+        decode=decode,
     )
     intermediate_fp8 = _quantize_fp8_activation(
         intermediate,
@@ -1823,6 +1840,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_warps=4,
         num_buffers=3,
         scale_load_mode="swizzle",
+        decode=decode,
     )
     weighted = flat.float() * topk_weights.reshape(-1, 1)
     return (
@@ -1873,12 +1891,13 @@ def gluon_mxfp_ragged_matmul(
         "schedule",
         "pingpong",
         "num_warps",
+        "decode",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
     wrapper_launch_kwargs = {
         k: v
         for k, v in launch_kwargs.items()
-        if k in {"block_m", "block_n", "block_k", "num_buffers", "num_warps"}
+        if k in {"block_m", "block_n", "block_k", "num_buffers", "num_warps", "decode"}
     }
     unsupported = sorted(extra_kwargs)
     if unsupported:
