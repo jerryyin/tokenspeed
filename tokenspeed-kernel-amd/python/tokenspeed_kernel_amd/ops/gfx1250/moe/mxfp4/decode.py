@@ -33,10 +33,6 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     get_scaled_dot_format_string,
     get_tdm_gather_scatter_idx_layout,
 )
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
-    MoESliceKProgram,
-    MoESliceNKProgram,
-)
 
 
 @gluon.jit
@@ -112,7 +108,23 @@ def _matmul_decode(
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
 ):
-    gl.static_assert(RAGGED_DIMENSION is None or RAGGED_DIMENSION == "M")
+    # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
+    gl.static_assert(
+        RAGGED_DIMENSION == "M",
+        "decode kernel only supports M-ragged MoE GEMMs",
+    )
+    gl.static_assert(
+        SCHEDULE == "baseline",
+        "decode kernel does not have schedule variants",
+    )
+    gl.static_assert(
+        not PINGPONG,
+        "decode kernel does not have a ping-pong variant",
+    )
+    gl.static_assert(
+        _W_SLICE_SIZES_DIVISIBILITY is None,
+        "decode kernel does not support K-ragged weights",
+    )
     SPLIT_K: gl.constexpr = 1
 
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
@@ -137,13 +149,7 @@ def _matmul_decode(
     WITH_X_MX_SCALE: gl.constexpr = XMxScale is not None
     WITH_W_MX_SCALE: gl.constexpr = WMxScale is not None
 
-    if SCHEDULE == "sliceNK":
-        NUM_SUBTILES: gl.constexpr = (1, 2, 2)
-    elif SCHEDULE == "sliceK":
-        NUM_SUBTILES: gl.constexpr = (1, 1, 2)
-    else:
-        gl.static_assert(SCHEDULE == "baseline")
-        NUM_SUBTILES: gl.constexpr = (1, 1, 1)
+    NUM_SUBTILES: gl.constexpr = (1, 1, 1)
 
     cfg = MoEConfig(
         BLOCK_M,
@@ -166,72 +172,52 @@ def _matmul_decode(
 
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W
 
-    if _W_SLICE_SIZES_DIVISIBILITY is None:
-        W_SLICE_SIZES_DIVISIBILITY: gl.constexpr = 1
-    else:
-        if PACKED_BLOCK_K_W > BLOCK_K:
-            W_SLICE_SIZES_DIVISIBILITY: gl.constexpr = _W_SLICE_SIZES_DIVISIBILITY * (
-                PACKED_BLOCK_K_W // BLOCK_K
-            )
-        else:
-            W_SLICE_SIZES_DIVISIBILITY: gl.constexpr = _W_SLICE_SIZES_DIVISIBILITY // (
-                BLOCK_K // PACKED_BLOCK_K_W
-            )
+    W_SLICE_SIZES_DIVISIBILITY: gl.constexpr = 1
 
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
 
     pid = gl.program_id(0)
-    if RAGGED_DIMENSION == "M":
-        padding_m = grid_m - gl.load(XBlockOffs + N_EXPTS_TOT)
-    else:
-        padding_m: gl.constexpr = 0
+    padding_m = grid_m - gl.load(XBlockOffs + N_EXPTS_TOT)
 
     unpadded_m = grid_m - padding_m
     gl.assume(unpadded_m >= 0)
-    total_actual_tiles = batch_size * unpadded_m * grid_n * SPLIT_K
+    total_actual_tiles = unpadded_m * grid_n * SPLIT_K
 
     if padding_m > 0 and pid >= total_actual_tiles:
         return
 
-    pid_s, pid_m, pid_n, pid_k = compute_pids(
+    _, pid_m, pid_n, pid_k = compute_pids(
         pid, unpadded_m, grid_n, total_actual_tiles, XCD_SWIZZLE, GROUP_M, SPLIT_K
     )
 
-    expt_id, start_z, start_z_out, start_m, _, off_m, off_k_x, off_k_w = (
-        compute_offsets(
-            pid_s,
-            pid_m,
-            pid_k,
-            XBlockSchedule,
-            XSliceOffs,
-            XBlockOffs,
-            X_SLICE_SIZES_DIVISIBILITY,
-            WBlockSchedule,
-            WSliceOffs,
-            W_SLICE_SIZES_DIVISIBILITY,
-            RAGGED_DIMENSION,
-            BLOCK_M,
-            BLOCK_K,
-            PACKED_BLOCK_K_W,
-            SPLIT_K,
-        )
+    expt_id, _, _, start_m, _, off_m, off_k_x, _ = compute_offsets(
+        0,
+        pid_m,
+        pid_k,
+        XBlockSchedule,
+        XSliceOffs,
+        XBlockOffs,
+        X_SLICE_SIZES_DIVISIBILITY,
+        WBlockSchedule,
+        WSliceOffs,
+        W_SLICE_SIZES_DIVISIBILITY,
+        RAGGED_DIMENSION,
+        BLOCK_M,
+        BLOCK_K,
+        PACKED_BLOCK_K_W,
+        SPLIT_K,
     )
     if X_SLICE_SIZES_DIVISIBILITY is not None:
         off_k_x = off_k_x // X_SLICE_SIZES_DIVISIBILITY * X_SLICE_SIZES_DIVISIBILITY
-    if W_SLICE_SIZES_DIVISIBILITY is not None:
-        off_k_w = off_k_w // W_SLICE_SIZES_DIVISIBILITY * W_SLICE_SIZES_DIVISIBILITY
 
-    if RAGGED_DIMENSION == "M":
-        eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
-    else:
-        eM = M
+    eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
 
     expt_id, off_m = expt_id.to(cfg.index_type), off_m.to(cfg.index_type)
-    start_m, start_z = start_m.to(cfg.index_type), start_z.to(cfg.index_type)
+    start_m = start_m.to(cfg.index_type)
     pid_n, pid_k = pid_n.to(cfg.index_type), pid_k.to(cfg.index_type)
 
-    X_ptr = X + start_z * stride_x_z
+    X_ptr = X
     if not cfg.USE_GATHER:
         X_ptr += start_m * stride_x_m
 
@@ -239,7 +225,7 @@ def _matmul_decode(
     w_offs = pid_n * BLOCK_N * stride_w_n
 
     if cfg.WITH_X_MX_SCALE:
-        XMxScale_ptr = XMxScale + start_z.to(cfg.index_type) * stride_x_mx_z
+        XMxScale_ptr = XMxScale
         if not cfg.USE_GATHER:
             XMxScale_ptr += start_m * stride_x_mx_m
     else:
@@ -280,44 +266,20 @@ def _matmul_decode(
         start_m,
     )
 
-    Y_ptr = Y + start_z_out.to(cfg.index_type) * stride_y_z
+    Y_ptr = Y
 
-    if SCHEDULE == "sliceNK":
-        pgm = MoESliceNKProgram.initialize(
-            cfg,
-            x_desc,
-            w_desc,
-            x_scale_desc,
-            w_scale_desc,
-            gathered_m,
-            off_k_x // cfg.DIV_FACTOR_X,
-        )
-    elif SCHEDULE == "sliceK":
-        pgm = MoESliceKProgram.initialize(
-            cfg,
-            x_desc,
-            w_desc,
-            x_scale_desc,
-            w_scale_desc,
-            gathered_m,
-            off_k_x // cfg.DIV_FACTOR_X,
-        )
-    else:
-        pgm = MoEPipelinedProgram.initialize(
-            cfg,
-            x_desc,
-            w_desc,
-            x_scale_desc,
-            w_scale_desc,
-            gathered_m,
-            off_k_x // cfg.DIV_FACTOR_X,
-        )
+    pgm = MoEPipelinedProgram.initialize(
+        cfg,
+        x_desc,
+        w_desc,
+        x_scale_desc,
+        w_scale_desc,
+        gathered_m,
+        off_k_x // cfg.DIV_FACTOR_X,
+    )
 
     loop_k = K - off_k_x
-    if PINGPONG:
-        acc = pgm.warp_pipeline(loop_k)
-    else:
-        acc = pgm.pipeline(loop_k)
+    acc = pgm.pipeline(loop_k)
     if XGlobalScale is not None and not cfg.WITH_X_MX_SCALE:
         acc *= gl.load(XGlobalScale).to(gl.float32)
 
@@ -330,10 +292,7 @@ def _matmul_decode(
     mask_bias_n = offs_bias_n < N
     if B is not None:
         BPtrs = B + expt_id * stride_b_e + offs_bias_n
-        if pid_k == 0:
-            bias = gl.load(BPtrs, mask=mask_bias_n, other=0)
-        else:
-            bias = gl.full([BLOCK_N], 0, dtype=gl.float32, layout=BLOCKED_LAYOUT_BIAS)
+        bias = gl.load(BPtrs, mask=mask_bias_n, other=0)
     else:
         bias = gl.full([BLOCK_N], 0, dtype=gl.float32, layout=BLOCKED_LAYOUT_BIAS)
 
@@ -415,4 +374,3 @@ def _matmul_decode(
         )
         y_mask = mask_m[:, None] & mask_n[None, :]
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
-

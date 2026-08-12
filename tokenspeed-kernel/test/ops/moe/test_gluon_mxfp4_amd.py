@@ -242,8 +242,11 @@ def test_bf16_activation_situ_moe() -> None:
     torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("decode", [False, True])
-def test_static_fp8_activation_moe(decode: bool) -> None:
+@pytest.mark.parametrize(
+    "decode,num_tokens",
+    [(False, 4), (True, 1), (True, 2), (True, 4), (True, 8), (True, 16)],
+)
+def test_static_fp8_activation_moe(decode: bool, num_tokens: int) -> None:
     cdna4 = is_cdna4()
     if cdna4:
         if decode:
@@ -258,7 +261,6 @@ def test_static_fp8_activation_moe(decode: bool) -> None:
     else:
         pytest.skip("Static FP8 activation is unavailable on this GPU")
 
-    num_tokens = 4
     num_experts = 4
     top_k = 2
     module = torch.nn.Module()
@@ -334,8 +336,10 @@ def test_static_fp8_activation_moe(decode: bool) -> None:
             dtype=torch.float32,
             device="cuda",
         )
-        topk_ids = torch.tensor(
-            [[0, 1], [2, 3], [1, 2], [3, 0]], dtype=torch.int32, device="cuda"
+        topk_ids = (
+            torch.arange(num_tokens * top_k, dtype=torch.int32, device="cuda")
+            .view(num_tokens, top_k)
+            .remainder(num_experts)
         )
         actual = _gfx1250_static_moe(
             hidden_states,

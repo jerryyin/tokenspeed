@@ -59,6 +59,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     get_tdm_gather_scatter_idx_layout,
     ragged_metadata_fields,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import _matmul_decode
 
 
 @dataclass
@@ -1140,13 +1141,6 @@ def _matmul(
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
 
 
-# The duplicate kernel still uses the prefill-only schedule classes above.
-# Import it here until decode specialization removes that dependency.
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (  # isort: skip
-    _matmul_decode,
-)
-
-
 def _can_overflow_int32(tensor: Any) -> bool:
     if tensor is None:
         return False
@@ -1280,7 +1274,7 @@ def matmul(
         precision_config: MX scale/output dtype configuration.
         x_global_scale: Optional scalar activation dequantization scale.
         fused_activation: Optional SwiGLU activation descriptor.
-        decode: Select the separately-defined duplicate kernel.
+        decode: Select the small-M, M-ragged decode kernel.
 
     Returns:
         ``(output, kernel)`` where ``kernel`` is the Triton/Gluon launch object.
@@ -1289,6 +1283,9 @@ def matmul(
         raise NotImplementedError(
             "gfx1250 MoE matmul does not support K-ragged weights"
         )
+    if decode:
+        schedule = "baseline"
+        pingpong = False
     _validate_schedule(
         schedule=schedule,
         pingpong=pingpong,
@@ -1311,6 +1308,8 @@ def matmul(
     has_scatter = scatter_indx is not None
     is_a_ragged = a_ragged_metadata is not None
     ragged_dimension = "M" if is_a_ragged else None
+    if decode and is_input_batched:
+        raise ValueError("decode kernel does not support dense-batched matmul")
 
     M = int(a_torch.shape[-2] if gather_indx is None else gather_indx.shape[0])
     K = int(a_torch.shape[-1])
@@ -1758,7 +1757,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_alpha: SwiGLU gate scale.
         swiglu_limit: Optional SwiGLU clamp limit; ``0`` disables clamping.
         swiglu_beta: SwiGLU linear branch offset.
-        decode: Select the separately-defined duplicate kernel for both projections.
+        decode: Select the small-M decode kernel for both MoE projections.
 
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
