@@ -233,11 +233,15 @@ def get_wmma_layout(num_warps, packed, use_wmma_scaled, scale_preshuffle):
         reg_bases = []
         tiles_per_warp = 1
 
-    # [NUM_WARPS // 2, 2]
-    if num_warps == 4:
-        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
-    else:
-        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
+    # Every warp-id bit advances N; none advances M. At BLOCK_M=16 the M axis
+    # holds a single 16-row WMMA tile, so a bit spent stepping M buys no
+    # additional tile coverage. Equals the previous four-warp AITER layout at
+    # num_warps == 4.
+    warp_bases = []
+    n_stride = tiles_per_warp
+    while n_stride < tiles_per_warp * num_warps:
+        warp_bases.append([0, n_stride])
+        n_stride *= 2
 
     if use_wmma_scaled:
         WMMA_INSTR_SHAPE: gl.constexpr = [16, 16, 64] if packed else [16, 16, 128]
