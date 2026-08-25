@@ -830,6 +830,7 @@ def _matmul(
     SWIZZLE_MX_SCALE: gl.constexpr,
     EVEN_K: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    INDEX_TYPE: gl.constexpr = gl.int32,
     NUM_BUFFERS: gl.constexpr = 2,
     SCALE_BLOCK: gl.constexpr = 32,
     SCHEDULE: gl.constexpr = "baseline",
@@ -843,16 +844,7 @@ def _matmul(
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
     DTYPE_W: gl.constexpr = get_scaled_dot_format_string(W.dtype.element_ty)
 
-    if GatherIndx is not None:
-        # In triton_kernels, when indices exceed int32 range, they are upcasted to int64. TDM Gather doesn't
-        # support int64 indices. Only int16 or int32 are supported. In that case, we need to fall back to
-        # AsyncCopy. Fortunately in the GPT-OSS example, we don't need to upcast.
-        gl.static_assert(
-            not UPCAST_INDICES,
-            "TDM Gather doesn't support int64 indices. Only int16 or int32 are supported.",
-        )
-
-    index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
+    address_index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
     USE_GATHER: gl.constexpr = GatherIndx is not None
 
     SCALE_PRESHUFFLE: gl.constexpr = (
@@ -882,7 +874,7 @@ def _matmul(
         WITH_X_MX_SCALE=WITH_X_MX_SCALE,
         WITH_W_MX_SCALE=WITH_W_MX_SCALE,
         SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
-        index_type=index_type,
+        index_type=INDEX_TYPE,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
@@ -953,9 +945,9 @@ def _matmul(
     else:
         eM = M
 
-    expt_id, off_m = expt_id.to(cfg.index_type), off_m.to(cfg.index_type)
-    start_m, start_z = start_m.to(cfg.index_type), start_z.to(cfg.index_type)
-    pid_n, pid_k = pid_n.to(cfg.index_type), pid_k.to(cfg.index_type)
+    expt_id, off_m = expt_id.to(address_index_type), off_m.to(address_index_type)
+    start_m, start_z = start_m.to(address_index_type), start_z.to(address_index_type)
+    pid_n, pid_k = pid_n.to(address_index_type), pid_k.to(address_index_type)
 
     X_ptr = X + start_z * stride_x_z
     if not cfg.USE_GATHER:
@@ -965,7 +957,7 @@ def _matmul(
     w_offs = pid_n * BLOCK_N * stride_w_n
 
     if cfg.WITH_X_MX_SCALE:
-        XMxScale_ptr = XMxScale + start_z.to(cfg.index_type) * stride_x_mx_z
+        XMxScale_ptr = XMxScale + start_z.to(address_index_type) * stride_x_mx_z
         if not cfg.USE_GATHER:
             XMxScale_ptr += start_m * stride_x_mx_m
     else:
@@ -1006,7 +998,7 @@ def _matmul(
         start_m,
     )
 
-    Y_ptr = Y + start_z_out.to(cfg.index_type) * stride_y_z
+    Y_ptr = Y + start_z_out.to(address_index_type) * stride_y_z
 
     if SCHEDULE == "sliceNK":
         pgm = MoESliceNKProgram.initialize(
@@ -1119,7 +1111,7 @@ def _matmul(
             layout=SCATTER_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * pid_n).to(cfg.index_type)
+        col_offset = (OUT_BLOCK_N * pid_n).to(gl.int32)
         y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
@@ -1136,8 +1128,8 @@ def _matmul(
         Y_ptr += start_m * stride_y_m
 
         y_offs = (
-            offs_y_m.to(cfg.index_type)[:, None] * stride_y_m
-            + offs_y_n.to(cfg.index_type)[None, :] * stride_y_n
+            offs_y_m.to(address_index_type)[:, None] * stride_y_m
+            + offs_y_n.to(address_index_type)[None, :] * stride_y_n
         )
         y_mask = mask_m[:, None] & mask_n[None, :]
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
@@ -1235,6 +1227,28 @@ def _validate_schedule(
             raise ValueError("pingpong requires num_buffers=3")
 
 
+def get_index_type(a, gather_indx, scatter_indx):
+    """Select the TDM gather/scatter index width, matching moe_gfx1250.py."""
+    max_uint16 = (1 << 16) - 1
+
+    if gather_indx is None and scatter_indx is None:
+        return gl.int32
+
+    if gather_indx is not None:
+        input_rows = a.shape_max[-2] if isinstance(a, Tensor) else a.shape[-2]
+        # Valid gather row indices are in [0, input_rows - 1].
+        if input_rows > max_uint16 + 1:
+            return gl.int32
+
+    if scatter_indx is not None:
+        # writeback_size is also used as the masked-off scatter sentinel, so it
+        # must fit in the index type in addition to all valid output row indices.
+        if scatter_indx.shape[0] > max_uint16:
+            return gl.int32
+
+    return gl.int16
+
+
 def matmul(
     a,
     b,
@@ -1323,6 +1337,7 @@ def matmul(
         K_W *= 2
     if K != K_W:
         raise ValueError(f"K mismatch: activation K={K} vs weight K={K_W}")
+    index_type = get_index_type(a, gather_indx, scatter_indx)
 
     out_dtype = precision_config.out_dtype or (
         a_torch.dtype if a_torch.dtype.is_floating_point else torch.bfloat16
@@ -1459,6 +1474,7 @@ def matmul(
         SWIZZLE_MX_SCALE=swizzle_mx_scale,
         EVEN_K=(K % opt_flags.block_k == 0),
         UPCAST_INDICES=should_upcast_indices(a, b, out_matmul),
+        INDEX_TYPE=index_type,
         NUM_BUFFERS=num_buffers,
         SCALE_BLOCK=scale_block,
         SCHEDULE=schedule,

@@ -34,6 +34,12 @@ LOCK_PATH = Path("/data/lock/amd-gpu.lock")
 BREADCRUMB_PATH = Path("/root/ablation-breadcrumb.jsonl")
 PREFLIGHT_PATH = Path("/root/PREFLIGHT.txt")
 MCE_PATH = Path("/root/MCE.json")
+REFERENCE_INDEX_SOURCE = Path(
+    "/root/triton/third_party/amd/python/examples/gluon/moe_gfx1250.py"
+)
+EXPECTED_REFERENCE_INDEX_SOURCE_SHA256 = (
+    "b825608f89a704fe979533a4badd6483e96cd79568e28b5c83cdf903ee922887"
+)
 
 BLOCK_M = 16
 BLOCK_N = 128
@@ -260,11 +266,24 @@ def _self_test() -> int:
         "while n_stride < tiles_per_warp * num_warps:",
         "ALL_N_LAYOUT: gl.constexpr = True",
         "ALL_N_LAYOUT=all_n_layout",
+        "def get_index_type(a, gather_indx, scatter_indx):",
+        "if input_rows > max_uint16 + 1:",
+        "if scatter_indx.shape[0] > max_uint16:",
+        "address_index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32",
+        "INDEX_TYPE=index_type",
     )
     joined = "\n".join((test, common, decode, fused))
     missing = [fragment for fragment in required_fragments if fragment not in joined]
     if missing:
         raise AssertionError(f"layout selector propagation missing: {missing}")
+    if "TDM Gather doesn't support int64 indices" in decode:
+        raise AssertionError("decode still conflates address and TDM index widths")
+    reference_sha256 = sha256_file(REFERENCE_INDEX_SOURCE)
+    if reference_sha256 != EXPECTED_REFERENCE_INDEX_SOURCE_SHA256:
+        raise AssertionError(
+            "reference index helper source drift: "
+            f"{reference_sha256} != {EXPECTED_REFERENCE_INDEX_SOURCE_SHA256}"
+        )
 
     synthetic = []
     for pair_index, order in enumerate((("H0", "D"), ("D", "H0"))):
@@ -290,6 +309,7 @@ def _self_test() -> int:
         "torch_imported": False,
     }
     hashes = {relative: sha256_file(REPO_ROOT / relative) for relative in SOURCE_FILES}
+    hashes[str(REFERENCE_INDEX_SOURCE)] = reference_sha256
     record = build_record(
         mode="timing",
         run_id="self-test",
@@ -584,6 +604,7 @@ def _device_main(args: argparse.Namespace) -> int:
     source_hashes = {
         relative: sha256_file(REPO_ROOT / relative) for relative in SOURCE_FILES
     }
+    source_hashes[str(REFERENCE_INDEX_SOURCE)] = sha256_file(REFERENCE_INDEX_SOURCE)
     breadcrumbs = Breadcrumbs(
         args.run_id,
         [str(Path(sys.executable).resolve()), *sys.argv],
@@ -592,8 +613,10 @@ def _device_main(args: argparse.Namespace) -> int:
 
     def prepare_fixture():
         import torch
+        from tokenspeed_kernel_amd._triton import gl
         from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
             _precomputed_topk_route,
+            get_index_type,
             gluon_mxfp_dispatch_swiglu,
         )
         from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
@@ -625,6 +648,7 @@ def _device_main(args: argparse.Namespace) -> int:
         torch.cuda.empty_cache()
 
         fixtures: dict[int, tuple[Any, Any, Any]] = {}
+        gather_index_types: dict[str, str] = {}
         for bpe in args.batch_per_expt:
             b = BPE_TO_B[bpe]
             input_generator = torch.Generator(device="cuda").manual_seed(314159 + bpe)
@@ -643,12 +667,21 @@ def _device_main(args: argparse.Namespace) -> int:
             metadata, gather, _scatter, _gate = _precomputed_topk_route(
                 topk_weights, topk_ids, NUM_EXPERTS
             )
+            index_type = get_index_type(x, gather, None)
+            if index_type != gl.int16:
+                raise RuntimeError(
+                    f"reference index rule did not select int16 at BPE={bpe}: "
+                    f"{index_type}"
+                )
+            gather_index_types[str(bpe)] = str(index_type)
             fixtures[bpe] = (x, metadata, gather)
         torch.cuda.synchronize()
         device_runtime = {
             "torch": torch.__version__,
             "hip": torch.version.hip,
             "device_name": torch.cuda.get_device_name(0),
+            "gather_index_type_by_batch_per_expt": gather_index_types,
+            "gather_index_type_rule": "moe_gfx1250.py::get_index_type",
         }
         return (
             torch,
