@@ -107,6 +107,7 @@ def _matmul_decode(
     SCHEDULE: gl.constexpr = "baseline",
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
+    ALL_N_LAYOUT: gl.constexpr = True,
 ):
     # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
     gl.static_assert(
@@ -168,6 +169,7 @@ def _matmul_decode(
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
         NUM_WARPS=NUM_WARPS,
+        ALL_N_LAYOUT=ALL_N_LAYOUT,
     )
 
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W

@@ -835,6 +835,7 @@ def _matmul(
     SCHEDULE: gl.constexpr = "baseline",
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
+    ALL_N_LAYOUT: gl.constexpr = True,
 ):
     gl.static_assert(RAGGED_DIMENSION is None or RAGGED_DIMENSION == "M")
     SPLIT_K: gl.constexpr = 1
@@ -886,6 +887,7 @@ def _matmul(
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
         NUM_WARPS=NUM_WARPS,
+        ALL_N_LAYOUT=ALL_N_LAYOUT,
     )
 
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W
@@ -1258,6 +1260,7 @@ def matmul(
     pingpong: bool = False,
     num_warps: int = 4,
     decode: bool = False,
+    all_n_layout: bool = True,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1461,6 +1464,7 @@ def matmul(
         SCHEDULE=schedule,
         PINGPONG=pingpong,
         NUM_WARPS=num_warps,
+        ALL_N_LAYOUT=all_n_layout,
         num_warps=num_warps,
     )
     out_final = c_storage.data
@@ -1515,6 +1519,7 @@ def gluon_mxfp_dispatch_swiglu(
     w_preshuffle: bool = False,
     x_scale_ragged_padded: bool = False,
     decode: bool = False,
+    all_n_layout: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch GEMM + fused SwiGLU using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1554,6 +1559,7 @@ def gluon_mxfp_dispatch_swiglu(
         num_buffers=num_buffers,
         w_transpose=w_transpose,
         decode=decode,
+        all_n_layout=all_n_layout,
     )
     return out
 

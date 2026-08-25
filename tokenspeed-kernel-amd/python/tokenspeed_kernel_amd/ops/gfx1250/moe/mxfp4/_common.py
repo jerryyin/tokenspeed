@@ -224,7 +224,13 @@ def get_tdm_gather_scatter_idx_layout(NUM_INDICES, NUM_WARPS):
 
 
 @gluon.constexpr_function
-def get_wmma_layout(num_warps, packed, use_wmma_scaled, scale_preshuffle):
+def get_wmma_layout(
+    num_warps,
+    packed,
+    use_wmma_scaled,
+    scale_preshuffle,
+    all_n_layout=True,
+):
     assert num_warps in (4, 8)
     if scale_preshuffle:
         reg_bases = [[0, 1], [1, 0]]
@@ -233,15 +239,24 @@ def get_wmma_layout(num_warps, packed, use_wmma_scaled, scale_preshuffle):
         reg_bases = []
         tiles_per_warp = 1
 
-    # Every warp-id bit advances N; none advances M. At BLOCK_M=16 the M axis
-    # holds a single 16-row WMMA tile, so a bit spent stepping M buys no
-    # additional tile coverage. Equals the previous four-warp AITER layout at
-    # num_warps == 4.
-    warp_bases = []
-    n_stride = tiles_per_warp
-    while n_stride < tiles_per_warp * num_warps:
-        warp_bases.append([0, n_stride])
-        n_stride *= 2
+    if all_n_layout:
+        # Every warp-id bit advances N; none advances M. At BLOCK_M=16 the M axis
+        # holds a single 16-row WMMA tile, so a bit spent stepping M buys no
+        # additional tile coverage. Equals the previous four-warp AITER layout at
+        # num_warps == 4.
+        warp_bases = []
+        n_stride = tiles_per_warp
+        while n_stride < tiles_per_warp * num_warps:
+            warp_bases.append([0, n_stride])
+            n_stride *= 2
+    elif num_warps == 4:
+        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
+    else:
+        warp_bases = [
+            [0, tiles_per_warp],
+            [0, tiles_per_warp * 2],
+            [tiles_per_warp, 0],
+        ]
 
     if use_wmma_scaled:
         WMMA_INSTR_SHAPE: gl.constexpr = [16, 16, 64] if packed else [16, 16, 128]
@@ -321,6 +336,7 @@ class MoEConfig:
         EVEN_K=True,
         USE_GATHER=False,
         NUM_WARPS=4,
+        ALL_N_LAYOUT=True,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
@@ -362,10 +378,18 @@ class MoEConfig:
         )
 
         WMMA_LAYOUT: gl.constexpr = get_wmma_layout(
-            NUM_WARPS, False, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
+            NUM_WARPS,
+            False,
+            self.USE_WMMA_SCALED,
+            SCALE_PRESHUFFLE,
+            ALL_N_LAYOUT,
         )
         WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(
-            NUM_WARPS, True, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
+            NUM_WARPS,
+            True,
+            self.USE_WMMA_SCALED,
+            SCALE_PRESHUFFLE,
+            ALL_N_LAYOUT,
         )
 
         DOT_K_WIDTH: gl.constexpr = 16 if self.USE_WMMA_SCALED else 8
