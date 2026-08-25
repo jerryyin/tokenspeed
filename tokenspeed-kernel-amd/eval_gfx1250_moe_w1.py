@@ -47,7 +47,7 @@ N = 10240
 BPE_TO_B = {1: 64, 4: 256, 16: 1024}
 ARMS = {"H0": False, "D": True}
 
-EXPECTED_BOOT_PREFIX = "d561b228"
+EXPECTED_BOOT = "83d8f785-3094-489e-82a4-8ccbc4ff8918"
 EXPECTED_TORCH = "2.10.0+rocm7.13.0a20260505-a0"
 EXPECTED_TOKENSPEED_TRITON = "3.8.10.post20260721"
 EXPECTED_TOKENSPEED_PROTON = "3.8.10.post20260721"
@@ -346,7 +346,7 @@ def _parse_preflight() -> dict[str, Any]:
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     if fields.get("boot_id") != boot_id:
         raise RuntimeError("PREFLIGHT boot does not match the running boot")
-    if not boot_id.startswith(EXPECTED_BOOT_PREFIX):
+    if boot_id != EXPECTED_BOOT:
         raise RuntimeError(f"unexpected boot: {boot_id}")
     return {
         "sha256": sha256_file(PREFLIGHT_PATH),
