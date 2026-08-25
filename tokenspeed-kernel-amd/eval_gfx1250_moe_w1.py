@@ -532,7 +532,7 @@ class Breadcrumbs:
                 "BLOCK_K": BLOCK_K,
                 "NUM_WARPS": NUM_WARPS,
                 "NUM_BUFFERS": NUM_BUFFERS,
-                "all_n_layout": ARMS[arm],
+                "all_n_layout": ARMS.get(arm),
             },
             "command": self.command,
         }
@@ -573,41 +573,16 @@ def _device_main(args: argparse.Namespace) -> int:
         args.official_correctness_result,
         args.official_correctness_sha256,
     )
-
-    import torch
-    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
-        _precomputed_topk_route,
-        gluon_mxfp_dispatch_swiglu,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
-        _swizzle_mxfp4,
-    )
-
-    if torch.__version__ != EXPECTED_TORCH:
-        raise RuntimeError(f"torch mismatch: {torch.__version__} != {EXPECTED_TORCH}")
     triton_version = importlib.metadata.version("tokenspeed-triton")
     proton_version = importlib.metadata.version("tokenspeed-proton")
     if triton_version != EXPECTED_TOKENSPEED_TRITON:
         raise RuntimeError(f"tokenspeed-triton mismatch: {triton_version}")
     if proton_version != EXPECTED_TOKENSPEED_PROTON:
         raise RuntimeError(f"tokenspeed-proton mismatch: {proton_version}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA/HIP device is unavailable")
 
     started = utc_now()
     source_hashes = {
         relative: sha256_file(REPO_ROOT / relative) for relative in SOURCE_FILES
-    }
-    runtime = {
-        **envelope,
-        "official_correctness_prerequisite": official_correctness,
-        "torch": torch.__version__,
-        "hip": torch.version.hip,
-        "tokenspeed_triton": triton_version,
-        "tokenspeed_proton": proton_version,
-        "device_name": torch.cuda.get_device_name(0),
-        "exclusive_lock": str(LOCK_PATH),
-        "cpu_affinity": sorted(os.sched_getaffinity(0)),
     }
     breadcrumbs = Breadcrumbs(
         args.run_id,
@@ -615,40 +590,100 @@ def _device_main(args: argparse.Namespace) -> int:
         envelope["preflight"]["boot_id"],
     )
 
-    weight_generator = torch.Generator(device="cuda").manual_seed(271828)
-    raw_weight = torch.randint(
-        0,
-        256,
-        (NUM_EXPERTS, N, K // 2),
-        dtype=torch.uint8,
-        device="cuda",
-        generator=weight_generator,
-    )
-    raw_scale = torch.full(
-        (NUM_EXPERTS, N, K // 32), 127, dtype=torch.uint8, device="cuda"
-    )
-    weight, weight_scale = _swizzle_mxfp4(raw_weight, raw_scale)
-    del raw_weight, raw_scale
-    bias = torch.zeros((NUM_EXPERTS, N), dtype=torch.float32, device="cuda")
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-    fixtures: dict[int, tuple[Any, Any, Any]] = {}
-    for bpe in args.batch_per_expt:
-        b = BPE_TO_B[bpe]
-        input_generator = torch.Generator(device="cuda").manual_seed(314159 + bpe)
-        x = torch.randn(
-            (b, K), dtype=torch.bfloat16, device="cuda", generator=input_generator
-        ).to(torch.float8_e4m3fn)
-        token_ids = torch.arange(b, device="cuda", dtype=torch.int32)[:, None]
-        slots = torch.arange(TOP_K, device="cuda", dtype=torch.int32)[None, :]
-        topk_ids = (token_ids + 64 * slots) % NUM_EXPERTS
-        topk_weights = torch.full((b, TOP_K), 0.25, dtype=torch.float32, device="cuda")
-        metadata, gather, _scatter, _gate = _precomputed_topk_route(
-            topk_weights, topk_ids, NUM_EXPERTS
+    def prepare_fixture():
+        import torch
+        from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
+            _precomputed_topk_route,
+            gluon_mxfp_dispatch_swiglu,
         )
-        fixtures[bpe] = (x, metadata, gather)
-    torch.cuda.synchronize()
+        from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
+            _swizzle_mxfp4,
+        )
+
+        if torch.__version__ != EXPECTED_TORCH:
+            raise RuntimeError(
+                f"torch mismatch: {torch.__version__} != {EXPECTED_TORCH}"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA/HIP device is unavailable")
+
+        weight_generator = torch.Generator(device="cuda").manual_seed(271828)
+        raw_weight = torch.randint(
+            0,
+            256,
+            (NUM_EXPERTS, N, K // 2),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=weight_generator,
+        )
+        raw_scale = torch.full(
+            (NUM_EXPERTS, N, K // 32), 127, dtype=torch.uint8, device="cuda"
+        )
+        weight, weight_scale = _swizzle_mxfp4(raw_weight, raw_scale)
+        del raw_weight, raw_scale
+        bias = torch.zeros((NUM_EXPERTS, N), dtype=torch.float32, device="cuda")
+        torch.cuda.empty_cache()
+
+        fixtures: dict[int, tuple[Any, Any, Any]] = {}
+        for bpe in args.batch_per_expt:
+            b = BPE_TO_B[bpe]
+            input_generator = torch.Generator(device="cuda").manual_seed(314159 + bpe)
+            x = torch.randn(
+                (b, K),
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=input_generator,
+            ).to(torch.float8_e4m3fn)
+            token_ids = torch.arange(b, device="cuda", dtype=torch.int32)[:, None]
+            slots = torch.arange(TOP_K, device="cuda", dtype=torch.int32)[None, :]
+            topk_ids = (token_ids + 64 * slots) % NUM_EXPERTS
+            topk_weights = torch.full(
+                (b, TOP_K), 0.25, dtype=torch.float32, device="cuda"
+            )
+            metadata, gather, _scatter, _gate = _precomputed_topk_route(
+                topk_weights, topk_ids, NUM_EXPERTS
+            )
+            fixtures[bpe] = (x, metadata, gather)
+        torch.cuda.synchronize()
+        device_runtime = {
+            "torch": torch.__version__,
+            "hip": torch.version.hip,
+            "device_name": torch.cuda.get_device_name(0),
+        }
+        return (
+            torch,
+            gluon_mxfp_dispatch_swiglu,
+            weight,
+            weight_scale,
+            bias,
+            fixtures,
+            device_runtime,
+        )
+
+    (
+        torch,
+        gluon_mxfp_dispatch_swiglu,
+        weight,
+        weight_scale,
+        bias,
+        fixtures,
+        device_runtime,
+    ) = breadcrumbs.call(
+        phase="fixture_setup",
+        bpe=args.batch_per_expt[0],
+        arm="fixture",
+        selected=False,
+        function=prepare_fixture,
+    )
+    runtime = {
+        **envelope,
+        "official_correctness_prerequisite": official_correctness,
+        **device_runtime,
+        "tokenspeed_triton": triton_version,
+        "tokenspeed_proton": proton_version,
+        "exclusive_lock": str(LOCK_PATH),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
+    }
 
     def launch(bpe: int, arm: str):
         x, metadata, gather = fixtures[bpe]
@@ -691,10 +726,9 @@ def _device_main(args: argparse.Namespace) -> int:
         )
 
     def timed_launch(bpe: int, arm: str, phase: str, selected: bool):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
         def invoke():
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
             start.record()
             output = launch(bpe, arm)
             end.record()
@@ -710,21 +744,30 @@ def _device_main(args: argparse.Namespace) -> int:
         )
 
     def compare_outputs(bpe: int, h0, d, phase: str) -> dict[str, Any]:
-        h0_cpu = h0.cpu()
-        d_cpu = d.cpu()
-        equal = bool(torch.equal(h0_cpu, d_cpu))
-        max_abs = float((h0_cpu.float() - d_cpu.float()).abs().max().item())
-        result = {
-            "batch_per_expt": bpe,
-            "B": BPE_TO_B[bpe],
-            "M": BPE_TO_B[bpe] * TOP_K,
-            "phase": phase,
-            "bitwise_equal": equal,
-            "max_abs_diff": max_abs,
-        }
-        if not equal:
-            raise AssertionError(f"H0 and D differ at BPE={bpe}: {result}")
-        return result
+        def invoke():
+            h0_cpu = h0.cpu()
+            d_cpu = d.cpu()
+            equal = bool(torch.equal(h0_cpu, d_cpu))
+            max_abs = float((h0_cpu.float() - d_cpu.float()).abs().max().item())
+            result = {
+                "batch_per_expt": bpe,
+                "B": BPE_TO_B[bpe],
+                "M": BPE_TO_B[bpe] * TOP_K,
+                "phase": phase,
+                "bitwise_equal": equal,
+                "max_abs_diff": max_abs,
+            }
+            if not equal:
+                raise AssertionError(f"H0 and D differ at BPE={bpe}: {result}")
+            return result
+
+        return breadcrumbs.call(
+            phase=f"correctness_compare_{phase}",
+            bpe=bpe,
+            arm="verification",
+            selected=False,
+            function=invoke,
+        )
 
     correctness: list[dict[str, Any]] = []
     samples: list[dict[str, Any]] = []
