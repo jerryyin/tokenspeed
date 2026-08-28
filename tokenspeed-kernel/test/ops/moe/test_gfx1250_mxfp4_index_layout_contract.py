@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -32,6 +33,7 @@ MXFP4_ROOT = (
 )
 COMMON = MXFP4_ROOT / "_common.py"
 INDEX_LAYOUT_CONSUMERS = (COMMON, MXFP4_ROOT / "decode.py", MXFP4_ROOT / "fused.py")
+INDEXING = MXFP4_ROOT / "_indexing.py"
 
 
 def _parse(path: Path) -> ast.Module:
@@ -49,7 +51,9 @@ def _index_layout_function() -> ast.FunctionDef:
 
 
 def _index_layout_return() -> ast.Call:
-    returns = [node for node in _index_layout_function().body if isinstance(node, ast.Return)]
+    returns = [
+        node for node in _index_layout_function().body if isinstance(node, ast.Return)
+    ]
     assert len(returns) == 1
     call = returns[0].value
     assert isinstance(call, ast.Call)
@@ -102,9 +106,15 @@ def test_every_index_layout_consumer_keeps_the_warp_distributed_axis() -> None:
         for node in ast.walk(_parse(path)):
             if not isinstance(node, ast.Call) or len(node.args) != 2:
                 continue
-            if not isinstance(node.func, ast.Attribute) or node.func.attr != "SliceLayout":
+            if (
+                not isinstance(node.func, ast.Attribute)
+                or node.func.attr != "SliceLayout"
+            ):
                 continue
-            if not isinstance(node.args[1], ast.Name) or node.args[1].id != "IDX_BASE_LAYOUT":
+            if (
+                not isinstance(node.args[1], ast.Name)
+                or node.args[1].id != "IDX_BASE_LAYOUT"
+            ):
                 continue
             calls.append(node)
 
@@ -125,3 +135,46 @@ def test_index_layout_is_not_the_two_axis_warp_split_shortcut() -> None:
 
     assert actual_warps_per_cta == "[1, NUM_WARPS]"
     assert actual_warps_per_cta != naive_warps_per_cta
+
+
+def test_tdm_index_width_uses_full_domain_and_scatter_sentinel() -> None:
+    spec = importlib.util.spec_from_file_location("gfx1250_mxfp4_indexing", INDEXING)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    select = module.select_tdm_index_width_bits
+
+    assert select(gather_input_rows=None, scatter_writeback_rows=None) == 32
+    assert select(gather_input_rows=65_536, scatter_writeback_rows=None) == 16
+    assert select(gather_input_rows=65_537, scatter_writeback_rows=None) == 32
+    assert select(gather_input_rows=None, scatter_writeback_rows=65_535) == 16
+    assert select(gather_input_rows=None, scatter_writeback_rows=65_536) == 32
+    assert select(gather_input_rows=65_536, scatter_writeback_rows=65_535) == 16
+    assert select(gather_input_rows=65_537, scatter_writeback_rows=1) == 32
+
+
+def test_descriptor_index_width_is_separate_from_address_width() -> None:
+    common = _parse(COMMON)
+    descriptor_casts = [
+        node
+        for node in ast.walk(common)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "to"
+        and ast.unparse(node.func.value).startswith("gl.load(")
+    ]
+    assert len(descriptor_casts) == 1
+    assert ast.unparse(descriptor_casts[0].args[0]) == "cfg.index_type"
+
+    for path in (MXFP4_ROOT / "decode.py", MXFP4_ROOT / "fused.py"):
+        tree = _parse(path)
+        source = path.read_text(encoding="utf-8")
+        annotated_names = {
+            node.target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        assert "address_index_type: gl.constexpr" in source
+        assert "index_type=INDEX_TYPE" in source
+        assert "address_index_type" in annotated_names
+        assert "index_type" not in annotated_names

@@ -65,6 +65,13 @@ into two eight-index instructions. It couples producer ownership to index
 packing instead of distributing rows over all eight warps, and its behavior
 therefore changes when index width is corrected independently.
 
+Descriptor index width is selected separately from pointer-address width. The
+kernel uses 16-bit TDM indices only when every possible gather row and the
+scatter masked-off sentinel fit in unsigned 16 bits; otherwise it uses 32-bit
+TDM indices. Pointer arithmetic remains 32- or 64-bit according to the tensor
+extent. Hard-coding 16-bit indices is not a safe shortcut: a gather input with
+more than 65,536 rows, or a scatter sentinel above 65,535, would truncate.
+
 ## Usage
 
 Install a ROCm-compatible PyTorch build first, then install the package from PyPI:

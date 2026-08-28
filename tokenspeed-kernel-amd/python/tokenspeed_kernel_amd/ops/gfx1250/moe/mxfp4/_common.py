@@ -522,7 +522,7 @@ def create_descriptor(
             GatherIndx_ptr + offs_m_gather,
             mask=start_m + offs_m_gather < M,
             other=0,
-        ).to(gl.int32)
+        ).to(cfg.index_type)
 
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=x_ptr,

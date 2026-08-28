@@ -106,6 +106,7 @@ def _matmul_decode(
     SWIZZLE_MX_SCALE: gl.constexpr,
     EVEN_K: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    INDEX_TYPE: gl.constexpr = gl.int32,
     NUM_BUFFERS: gl.constexpr = 2,
     SCALE_BLOCK: gl.constexpr = 32,
     SCHEDULE: gl.constexpr = "baseline",
@@ -134,16 +135,7 @@ def _matmul_decode(
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
     DTYPE_W: gl.constexpr = get_scaled_dot_format_string(W.dtype.element_ty)
 
-    if GatherIndx is not None:
-        # In triton_kernels, when indices exceed int32 range, they are upcasted to int64. TDM Gather doesn't
-        # support int64 indices. Only int16 or int32 are supported. In that case, we need to fall back to
-        # AsyncCopy. Fortunately in the GPT-OSS example, we don't need to upcast.
-        gl.static_assert(
-            not UPCAST_INDICES,
-            "TDM Gather doesn't support int64 indices. Only int16 or int32 are supported.",
-        )
-
-    index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
+    address_index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
     USE_GATHER: gl.constexpr = GatherIndx is not None
 
     SCALE_PRESHUFFLE: gl.constexpr = (
@@ -167,7 +159,7 @@ def _matmul_decode(
         WITH_X_MX_SCALE=WITH_X_MX_SCALE,
         WITH_W_MX_SCALE=WITH_W_MX_SCALE,
         SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
-        index_type=index_type,
+        index_type=INDEX_TYPE,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
@@ -217,9 +209,9 @@ def _matmul_decode(
 
     eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
 
-    expt_id, off_m = expt_id.to(cfg.index_type), off_m.to(cfg.index_type)
-    start_m = start_m.to(cfg.index_type)
-    pid_n, pid_k = pid_n.to(cfg.index_type), pid_k.to(cfg.index_type)
+    expt_id, off_m = expt_id.to(address_index_type), off_m.to(address_index_type)
+    start_m = start_m.to(address_index_type)
+    pid_n, pid_k = pid_n.to(address_index_type), pid_k.to(address_index_type)
 
     X_ptr = X
     if not cfg.USE_GATHER:
@@ -366,7 +358,7 @@ def _matmul_decode(
             layout=SCATTER_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * pid_n).to(cfg.index_type)
+        col_offset = (OUT_BLOCK_N * pid_n).to(gl.int32)
         y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
@@ -383,8 +375,8 @@ def _matmul_decode(
         Y_ptr += start_m * stride_y_m
 
         y_offs = (
-            offs_y_m.to(cfg.index_type)[:, None] * stride_y_m
-            + offs_y_n.to(cfg.index_type)[None, :] * stride_y_n
+            offs_y_m.to(address_index_type)[:, None] * stride_y_m
+            + offs_y_n.to(address_index_type)[None, :] * stride_y_n
         )
         y_mask = mask_m[:, None] & mask_n[None, :]
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
