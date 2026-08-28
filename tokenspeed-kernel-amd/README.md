@@ -51,6 +51,20 @@ tokenspeed-kernel-amd/
 
 Public entry points currently remain architecture-specific. Consumers should import the implementation matching the target GPU, or use TokenSpeed-Kernel to select a compatible implementation through its registry.
 
+### gfx1250 MXFP4 gather and scatter indices
+
+The gfx1250 MXFP4 kernels partition gather and scatter index rows across every
+warp in the CTA. The shared index-layout helper uses the row-distributed
+`BlockedLayout([1, NUM_INDICES // NUM_WARPS], [32, 1], [1, NUM_WARPS], [0, 1])`
+and its consumers remove dimension 0 with `SliceLayout(0, ...)`.
+
+Do not replace this with the superficially similar
+`warpsPerCTA=[2, 4]`/`SliceLayout(1, ...)` shortcut. With 32-bit gather indices,
+that layout's two producer waves arise from the compiler splitting 16 indices
+into two eight-index instructions. It couples producer ownership to index
+packing instead of distributing rows over all eight warps, and its behavior
+therefore changes when index width is corrected independently.
+
 ## Usage
 
 Install a ROCm-compatible PyTorch build first, then install the package from PyPI:
