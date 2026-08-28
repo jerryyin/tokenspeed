@@ -236,7 +236,10 @@ def _matmul_decode(
 
     descriptor_m = M
     if not cfg.USE_GATHER:
-        descriptor_m = eM - off_m
+        # Pointer arithmetic may need int64 for expert tensors larger than
+        # 2 GiB, but a TDM descriptor extent is 32-bit and this value is only
+        # the remaining expert-local row count.
+        descriptor_m = (eM - off_m).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,

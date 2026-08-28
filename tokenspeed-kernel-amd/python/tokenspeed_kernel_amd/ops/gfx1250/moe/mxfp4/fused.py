@@ -977,7 +977,9 @@ def _matmul(
 
     descriptor_m = M
     if not cfg.USE_GATHER:
-        descriptor_m = eM - off_m
+        # Keep wide expert base-pointer arithmetic separate from the 32-bit
+        # expert-local extent required by the TDM descriptor.
+        descriptor_m = (eM - off_m).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,

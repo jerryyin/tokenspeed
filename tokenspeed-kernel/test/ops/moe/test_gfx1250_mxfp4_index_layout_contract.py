@@ -178,3 +178,51 @@ def test_descriptor_index_width_is_separate_from_address_width() -> None:
         assert "index_type=INDEX_TYPE" in source
         assert "address_index_type" in annotated_names
         assert "index_type" not in annotated_names
+
+
+def test_no_gather_descriptor_extent_cast_is_surgical() -> None:
+    expected_extent = ast.parse("(eM - off_m).to(gl.int32)", mode="eval").body
+    expected_address_type = ast.parse(
+        "gl.int64 if UPCAST_INDICES else gl.int32", mode="eval"
+    ).body
+
+    for path in (MXFP4_ROOT / "decode.py", MXFP4_ROOT / "fused.py"):
+        tree = _parse(path)
+        source = path.read_text(encoding="utf-8")
+
+        address_types = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "address_index_type"
+        ]
+        assert len(address_types) == 1, path
+        assert ast.dump(address_types[0], include_attributes=False) == ast.dump(
+            expected_address_type, include_attributes=False
+        )
+
+        extent_casts = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "descriptor_m"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+        ]
+        assert len(extent_casts) == 1, path
+        assert ast.dump(extent_casts[0], include_attributes=False) == ast.dump(
+            expected_extent, include_attributes=False
+        )
+
+        # The rejected shortcut is to narrow all indices or the expert base
+        # pointer.  Those values must continue to use address_index_type.
+        assert (
+            "expt_id, off_m = expt_id.to(address_index_type), off_m.to(address_index_type)"
+            in source
+        )
+        assert "W_ptr = W + expt_id * stride_w_e" in source
+        assert "expt_id.to(gl.int32)" not in source
+        assert "off_m.to(gl.int32)" not in source
