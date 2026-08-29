@@ -34,6 +34,7 @@ MXFP4_ROOT = (
 COMMON = MXFP4_ROOT / "_common.py"
 INDEX_LAYOUT_CONSUMERS = (COMMON, MXFP4_ROOT / "decode.py", MXFP4_ROOT / "fused.py")
 INDEXING = MXFP4_ROOT / "_indexing.py"
+FUSED = MXFP4_ROOT / "fused.py"
 
 
 def _parse(path: Path) -> ast.Module:
@@ -151,6 +152,65 @@ def test_tdm_index_width_uses_full_domain_and_scatter_sentinel() -> None:
     assert select(gather_input_rows=None, scatter_writeback_rows=65_536) == 32
     assert select(gather_input_rows=65_536, scatter_writeback_rows=65_535) == 16
     assert select(gather_input_rows=65_537, scatter_writeback_rows=1) == 32
+
+    for kwargs in (
+        {"gather_input_rows": -1, "scatter_writeback_rows": None},
+        {"gather_input_rows": None, "scatter_writeback_rows": -1},
+    ):
+        try:
+            select(**kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"negative index domain was accepted: {kwargs}")
+
+
+def test_host_width_selection_reaches_the_kernel_constexpr() -> None:
+    tree = _parse(FUSED)
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    selector = functions["get_index_type"]
+    wrapper = functions["matmul"]
+
+    selector_source = ast.unparse(selector)
+    assert "int(a.shape_max[-2]) if isinstance(a, Tensor) else int(a.shape[-2])" in (
+        selector_source
+    )
+    assert (
+        "None if scatter_indx is None else int(scatter_indx.shape[0])"
+        in selector_source
+    )
+    assert selector_source.count("select_tdm_index_width_bits(") == 1
+
+    assignments = [
+        node
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "index_type"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    assert ast.unparse(assignments[0].value) == "get_index_type(a, gather_indx, scatter_indx)"
+
+    launches = [
+        node
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call)
+        and any(keyword.arg == "INDEX_TYPE" for keyword in node.keywords)
+    ]
+    assert len(launches) == 1
+    index_keywords = [
+        keyword for keyword in launches[0].keywords if keyword.arg == "INDEX_TYPE"
+    ]
+    assert len(index_keywords) == 1
+    assert ast.unparse(index_keywords[0].value) == "index_type"
+
+    # The rejected shortcut is a hard-coded narrow launch type. It would make
+    # small campaign fixtures pass while silently truncating a larger domain.
+    assert "INDEX_TYPE=gl.int16" not in FUSED.read_text(encoding="utf-8")
 
 
 def test_descriptor_index_width_is_separate_from_address_width() -> None:
