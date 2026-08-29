@@ -286,3 +286,46 @@ def test_no_gather_descriptor_extent_cast_is_surgical() -> None:
         assert "W_ptr = W + expt_id * stride_w_e" in source
         assert "expt_id.to(gl.int32)" not in source
         assert "off_m.to(gl.int32)" not in source
+
+
+def test_buffer_store_offset_narrowing_is_surgical() -> None:
+    """The instruction offset is i32 without narrowing tensor base arithmetic."""
+
+    for path in (MXFP4_ROOT / "decode.py", MXFP4_ROOT / "fused.py"):
+        tree = _parse(path)
+        source = path.read_text(encoding="utf-8")
+        assignments = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "y_offs"
+                for target in node.targets
+            )
+        ]
+        assert len(assignments) == 1, path
+        value = assignments[0]
+        assert isinstance(value, ast.Call)
+        assert isinstance(value.func, ast.Attribute) and value.func.attr == "to"
+        assert len(value.args) == 1
+        assert ast.unparse(value.args[0]) == "gl.int32"
+        assert "address_index_type" in ast.unparse(value.func.value)
+
+        stores = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "buffer_store"
+        ]
+        assert len(stores) == 1, path
+        assert len(stores[0].args) >= 3
+        assert ast.unparse(stores[0].args[2]) == "y_offs"
+
+        # The rejected shortcut is to set all address arithmetic to int32.
+        # Expert and batch base-pointer advances must remain wide when the
+        # backing allocation exceeds the signed 32-bit offset domain.
+        assert "gl.int64 if UPCAST_INDICES else gl.int32" in source
+        assert "Y_ptr += start_m * stride_y_m" in source
+        assert "offs_y_m.to(address_index_type)" in source
+        assert "offs_y_n.to(address_index_type)" in source

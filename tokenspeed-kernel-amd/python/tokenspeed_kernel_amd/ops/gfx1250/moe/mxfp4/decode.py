@@ -377,9 +377,12 @@ def _matmul_decode(
 
         Y_ptr += start_m * stride_y_m
 
+        # buffer_store accepts a 32-bit expert-local element offset. Keep the
+        # potentially wide start_m base-pointer advance above, then narrow only
+        # the bounded offset passed to the instruction.
         y_offs = (
             offs_y_m.to(address_index_type)[:, None] * stride_y_m
             + offs_y_n.to(address_index_type)[None, :] * stride_y_n
-        )
+        ).to(gl.int32)
         y_mask = mask_m[:, None] & mask_n[None, :]
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
