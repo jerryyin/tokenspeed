@@ -319,18 +319,15 @@ def _matmul_decode(
     BLOCKED_LAYOUT_Y: gl.constexpr = get_blocked_layout(
         [BLOCK_M, OUT_BLOCK_N], Y.dtype, cfg.NUM_WARPS
     )
-    OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
-    )
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
-    out_smem = gl.allocate_shared_memory(
-        Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), OUTPUT_SHARED_LAYOUT
-    )
-    out_smem.store(out)
 
     if WriteBackIndx is not None:
         WriteBackIndx += start_m
+
+        SCATTER_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
 
         IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
             BLOCK_M, cfg.NUM_WARPS
@@ -346,12 +343,17 @@ def _matmul_decode(
         )
         dst_row_indices = dst_row_indices.to(cfg.index_type)
 
+        out_smem = gl.allocate_shared_memory(
+            Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), SCATTER_SHARED_LAYOUT
+        )
+        out_smem.store(out)
+
         y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
             block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=OUTPUT_SHARED_LAYOUT,
+            layout=SCATTER_SHARED_LAYOUT,
         )
 
         col_offset = (OUT_BLOCK_N * pid_n).to(gl.int32)
@@ -361,9 +363,6 @@ def _matmul_decode(
         gl.amd.gfx1250.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        # Retain the donor's shared-output synchronization, then reload into
-        # the blocked layout before TokenSpeed's production-safe direct store.
-        out = out_smem.load(BLOCKED_LAYOUT_Y)
         offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
             0, OUT_BLOCK_N, gl.SliceLayout(0, BLOCKED_LAYOUT_Y)
