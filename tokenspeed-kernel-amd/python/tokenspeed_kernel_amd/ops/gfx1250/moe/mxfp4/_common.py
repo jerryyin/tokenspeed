@@ -429,7 +429,12 @@ class MoEConfig:
 
         BLOCK_K_PACKED_X = BLOCK_K // self.DIV_FACTOR_X
         BLOCK_K_PACKED_W = BLOCK_K // self.DIV_FACTOR_W
-        PAD_INTERVAL_X = 256 if BLOCK_K_PACKED_X <= 256 else BLOCK_K_PACKED_X
+        if USE_GATHER:
+            # TDM gather requires the padding interval to divide the innermost
+            # block dimension. Dense loads tolerate the broader 256B interval.
+            PAD_INTERVAL_X = BLOCK_K_PACKED_X
+        else:
+            PAD_INTERVAL_X = 256 if BLOCK_K_PACKED_X <= 256 else BLOCK_K_PACKED_X
         PAD_INTERVAL_W = 256 if BLOCK_K_PACKED_W <= 256 else BLOCK_K_PACKED_W
 
         self.shared_layout_x = gl.constexpr(
