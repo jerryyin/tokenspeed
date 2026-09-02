@@ -282,15 +282,20 @@ def _matmul_decode(
     if XGlobalScale is not None and not cfg.WITH_X_MX_SCALE:
         acc *= gl.load(XGlobalScale).to(gl.float32)
 
-    # bias (SPLIT_K is fixed to one in decode).
-    BIAS_LAYOUT: gl.constexpr = gl.SliceLayout(0, cfg.acc_layout)
-    offs_bias_n = BLOCK_N * pid_n + gl.arange(0, BLOCK_N, BIAS_LAYOUT)
+    # bias
+    b_dtype = B.dtype if B is not None else gl.float32
+    BLOCKED_LAYOUT_BIAS: gl.constexpr = get_blocked_layout(
+        [BLOCK_N], b_dtype, cfg.NUM_WARPS, 1
+    )
+    offs_bias_n = BLOCK_N * pid_n + gl.arange(0, BLOCK_N, BLOCKED_LAYOUT_BIAS)
     mask_bias_n = offs_bias_n < N
     if B is not None:
         BPtrs = B + expt_id * stride_b_e + offs_bias_n
         bias = gl.load(BPtrs, mask=mask_bias_n, other=0)
     else:
-        bias = gl.full([BLOCK_N], 0, dtype=gl.float32, layout=BIAS_LAYOUT)
+        bias = gl.full([BLOCK_N], 0, dtype=gl.float32, layout=BLOCKED_LAYOUT_BIAS)
+
+    bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
     acc += bias[None, :]
 
     gl.static_assert(
