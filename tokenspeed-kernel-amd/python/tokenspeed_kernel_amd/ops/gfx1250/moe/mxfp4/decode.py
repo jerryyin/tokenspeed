@@ -105,10 +105,6 @@ def _matmul_decode(
     SCHEDULE: gl.constexpr = "baseline",
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
-    L2_PREFETCH_DISTANCE: gl.constexpr = -1,
-    PARTIAL_TDM: gl.constexpr = False,
-    RESOLVE_PARTITION_CONFLICTS: gl.constexpr = False,
-    TDM_SPLIT: gl.constexpr = False,
 ):
     # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
     gl.static_assert(
@@ -127,16 +123,6 @@ def _matmul_decode(
         _W_SLICE_SIZES_DIVISIBILITY is None,
         "decode kernel does not support K-ragged weights",
     )
-    gl.static_assert(
-        L2_PREFETCH_DISTANCE == -1,
-        "decode kernel does not support L2 prefetching",
-    )
-    gl.static_assert(not PARTIAL_TDM, "decode kernel does not support partial TDM")
-    gl.static_assert(
-        not RESOLVE_PARTITION_CONFLICTS,
-        "decode kernel does not support partition-conflict resolution",
-    )
-    gl.static_assert(not TDM_SPLIT, "decode kernel does not support TDM split")
     SPLIT_K: gl.constexpr = 1
 
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
@@ -171,10 +157,6 @@ def _matmul_decode(
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
         NUM_WARPS=NUM_WARPS,
-        TDM_WARP_USED_HINT=None,
-        L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
-        RESOLVE_PARTITION_CONFLICTS=RESOLVE_PARTITION_CONFLICTS,
-        TDM_SPLIT=TDM_SPLIT,
     )
 
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W
