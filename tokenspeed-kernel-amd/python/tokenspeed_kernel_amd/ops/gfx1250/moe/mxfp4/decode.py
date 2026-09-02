@@ -25,8 +25,6 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
     MoEPipelinedProgram,
-    _situ_gfx1250,
-    _swiglu_gfx1250,
     compute_offsets,
     compute_pids,
     create_descriptor,
@@ -87,13 +85,8 @@ def _matmul_decode(
     batch_size,
     grid_m,
     grid_n,
-    DO_SWIGLU: gl.constexpr,
-    SWIGLU_ALPHA: gl.constexpr,
-    SWIGLU_LIMIT: gl.constexpr,
-    SWIGLU_BETA: gl.constexpr,
-    DO_SITU: gl.constexpr,
-    SITU_BETA: gl.constexpr,
-    SITU_LINEAR_BETA: gl.constexpr,
+    ACTIVATION_FN: gl.constexpr,
+    activation_fn_args,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     # MoE config
     N_EXPTS_TOT: gl.constexpr,
@@ -112,6 +105,10 @@ def _matmul_decode(
     SCHEDULE: gl.constexpr = "baseline",
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
+    L2_PREFETCH_DISTANCE: gl.constexpr = -1,
+    PARTIAL_TDM: gl.constexpr = False,
+    RESOLVE_PARTITION_CONFLICTS: gl.constexpr = False,
+    TDM_SPLIT: gl.constexpr = False,
 ):
     # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
     gl.static_assert(
@@ -130,6 +127,16 @@ def _matmul_decode(
         _W_SLICE_SIZES_DIVISIBILITY is None,
         "decode kernel does not support K-ragged weights",
     )
+    gl.static_assert(
+        L2_PREFETCH_DISTANCE == -1,
+        "decode kernel does not support L2 prefetching",
+    )
+    gl.static_assert(not PARTIAL_TDM, "decode kernel does not support partial TDM")
+    gl.static_assert(
+        not RESOLVE_PARTITION_CONFLICTS,
+        "decode kernel does not support partition-conflict resolution",
+    )
+    gl.static_assert(not TDM_SPLIT, "decode kernel does not support TDM split")
     SPLIT_K: gl.constexpr = 1
 
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
@@ -164,6 +171,10 @@ def _matmul_decode(
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
         NUM_WARPS=NUM_WARPS,
+        TDM_WARP_USED_HINT=None,
+        L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
+        RESOLVE_PARTITION_CONFLICTS=RESOLVE_PARTITION_CONFLICTS,
+        TDM_SPLIT=TDM_SPLIT,
     )
 
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W
@@ -282,34 +293,19 @@ def _matmul_decode(
     if XGlobalScale is not None and not cfg.WITH_X_MX_SCALE:
         acc *= gl.load(XGlobalScale).to(gl.float32)
 
-    # bias
-    b_dtype = B.dtype if B is not None else gl.float32
-    BLOCKED_LAYOUT_BIAS: gl.constexpr = get_blocked_layout(
-        [BLOCK_N], b_dtype, cfg.NUM_WARPS, 1
-    )
-    offs_bias_n = BLOCK_N * pid_n + gl.arange(0, BLOCK_N, BLOCKED_LAYOUT_BIAS)
+    # bias (SPLIT_K is fixed to one in decode).
+    BIAS_LAYOUT: gl.constexpr = gl.SliceLayout(0, cfg.acc_layout)
+    offs_bias_n = BLOCK_N * pid_n + gl.arange(0, BLOCK_N, BIAS_LAYOUT)
     mask_bias_n = offs_bias_n < N
     if B is not None:
         BPtrs = B + expt_id * stride_b_e + offs_bias_n
         bias = gl.load(BPtrs, mask=mask_bias_n, other=0)
     else:
-        bias = gl.full([BLOCK_N], 0, dtype=gl.float32, layout=BLOCKED_LAYOUT_BIAS)
-
-    bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+        bias = gl.full([BLOCK_N], 0, dtype=gl.float32, layout=BIAS_LAYOUT)
     acc += bias[None, :]
 
-    gl.static_assert(
-        not (DO_SWIGLU and DO_SITU),
-        "SwiGLU and SiTU cannot both be enabled",
-    )
-    if DO_SITU:
-        out = _situ_gfx1250(acc, SITU_BETA, SITU_LINEAR_BETA)
-        gl.static_assert(
-            out.shape[1] == OUT_BLOCK_N,
-            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
-        )
-    elif DO_SWIGLU:
-        out = _swiglu_gfx1250(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA)
+    if ACTIVATION_FN is not None:
+        out = ACTIVATION_FN(acc, *activation_fn_args)
         gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -324,15 +320,18 @@ def _matmul_decode(
     BLOCKED_LAYOUT_Y: gl.constexpr = get_blocked_layout(
         [BLOCK_M, OUT_BLOCK_N], Y.dtype, cfg.NUM_WARPS
     )
+    OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
+    out_smem = gl.allocate_shared_memory(
+        Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), OUTPUT_SHARED_LAYOUT
+    )
+    out_smem.store(out)
 
     if WriteBackIndx is not None:
         WriteBackIndx += start_m
-
-        SCATTER_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
 
         IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
             BLOCK_M, cfg.NUM_WARPS
@@ -348,17 +347,12 @@ def _matmul_decode(
         )
         dst_row_indices = dst_row_indices.to(cfg.index_type)
 
-        out_smem = gl.allocate_shared_memory(
-            Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), SCATTER_SHARED_LAYOUT
-        )
-        out_smem.store(out)
-
         y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
             block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SCATTER_SHARED_LAYOUT,
+            layout=OUTPUT_SHARED_LAYOUT,
         )
 
         col_offset = (OUT_BLOCK_N * pid_n).to(gl.int32)
@@ -368,6 +362,9 @@ def _matmul_decode(
         gl.amd.gfx1250.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
+        # Retain the donor's shared-output synchronization, then reload into
+        # the blocked layout before TokenSpeed's production-safe direct store.
+        out = out_smem.load(BLOCKED_LAYOUT_Y)
         offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
             0, OUT_BLOCK_N, gl.SliceLayout(0, BLOCKED_LAYOUT_Y)

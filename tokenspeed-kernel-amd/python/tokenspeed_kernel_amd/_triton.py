@@ -18,18 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Single point of indirection for the Triton vendor release package used by
-# tokenspeed-kernel-amd. All implementation code imports Triton symbols from
-# here so the underlying distribution can be swapped in one place.
+# Single point of indirection for the Triton package used by
+# tokenspeed-kernel-amd.  The gfx1250 decode-MoE donor was validated with the
+# campaign Triton checkout, so the maximal source synchronization deliberately
+# keeps its compiler/runtime boundary instead of silently compiling the copied
+# surface with the vendor release package.
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.experimental.gluon.language as gl
-from tokenspeed_triton import language as tl
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
+import triton
+import triton.experimental.gluon.language as gl
+from triton import language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon.language.amd.cdna4 import (
     async_copy as cdna4_async_copy,
 )
-from tokenspeed_triton.language.core import _aggregate as aggregate
+from triton.language.core import _aggregate as aggregate
 
 __all__ = [
     "aggregate",
