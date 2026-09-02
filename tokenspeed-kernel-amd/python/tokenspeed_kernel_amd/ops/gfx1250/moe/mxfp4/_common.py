@@ -19,8 +19,6 @@
 # SOFTWARE.
 
 
-from __future__ import annotations
-
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.moe._common import RaggedTensorMetadata
 
