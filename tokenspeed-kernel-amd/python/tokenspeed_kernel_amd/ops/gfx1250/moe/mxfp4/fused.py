@@ -42,6 +42,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe._common import (
     Storage,
     Tensor,
     make_ragged_tensor_metadata,
+    swiglu_fn,
     wrap_torch_tensor,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
@@ -58,14 +59,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     get_scaled_dot_format_string,
     get_tdm_gather_scatter_idx_layout,
     ragged_metadata_fields,
-    swiglu_fn,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._indexing import (
     select_tdm_index_width_bits,
-)
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._specialize import (
-    ClosureArg,
-    SpecializationModule,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import _matmul_decode
 
@@ -1159,15 +1155,6 @@ def _matmul(
         gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
 
 
-decode_specializations = SpecializationModule(
-    "tokenspeed_gfx1250_moe_decode",
-    kernels=[("_matmul_decode", _matmul_decode)],
-    closure_args={
-        "activation": ClosureArg("ACTIVATION_FN", "activation_fn_args"),
-    },
-)
-
-
 def _can_overflow_int32(tensor: Any) -> bool:
     if tensor is None:
         return False
@@ -1499,26 +1486,7 @@ def matmul(
                 [float(x_global_scale)], device=a.device, dtype=torch.float32
             )
 
-    if decode:
-        target_kernel = decode_specializations.get(
-            activation=fused_activation.specs
-        )._matmul_decode
-        activation_launch_args = (
-            *fused_activation.fn_args,
-            activation_reduction_n,
-        )
-    else:
-        target_kernel = _matmul
-        activation_launch_args = (
-            do_swiglu,
-            swiglu_alpha,
-            swiglu_limit,
-            swiglu_beta,
-            do_situ,
-            situ_beta,
-            situ_linear_beta,
-            activation_reduction_n,
-        )
+    target_kernel = _matmul_decode if decode else _matmul
     kernel = target_kernel[(grid,)](
         c_storage.data,
         *out_matmul.stride(),
@@ -1547,7 +1515,14 @@ def matmul(
         batch_size,
         grid_m,
         grid_n,
-        *activation_launch_args,
+        do_swiglu,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
+        do_situ,
+        situ_beta,
+        situ_linear_beta,
+        activation_reduction_n,
         n_valid_slices,
         opt_flags.block_m,
         opt_flags.block_n,

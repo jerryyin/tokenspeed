@@ -207,19 +207,6 @@ def _situ_gfx1250(
     return gate * linear
 
 
-@gluon.jit
-def swiglu_fn(acc, alpha, limit):
-    """Donor-equivalent compiler-visible SwiGLU closure (linear beta one)."""
-
-    block_m: gl.constexpr = acc.shape[0]
-    out_block_n: gl.constexpr = acc.shape[1] // 2
-    gate, linear = gl.split(acc.reshape((block_m, out_block_n, 2)))
-    gate = gl.minimum(gate, limit)
-    linear = gl.clamp(linear, -limit, limit)
-    s = gate / (1.0 + gl.exp(-alpha * gate))
-    return gl.fma(s, linear, s)
-
-
 @gluon.constexpr_function
 def get_bitwidth(dtype):
     if isinstance(dtype, gl.pointer_type):
