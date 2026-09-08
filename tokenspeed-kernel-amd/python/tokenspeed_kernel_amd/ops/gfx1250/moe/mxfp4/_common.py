@@ -87,10 +87,14 @@ def _swizzle2d(pid, grid_m, grid_n, GROUP_M: gl.constexpr):
 def _enforce_wave_uniform_i32(value):
     # Force emitting v_readfirstlane to indicate input value is wave-uniform for
     # potential compiler optimizations.
+    # v_readfirstlane_b32 reads one 32-bit VGPR, so a caller holding its value in
+    # the wide index type would assemble a register pair and be rejected by the
+    # assembler. Narrow at this operand rather than at each call site, since the
+    # declared result type already commits this helper to 32 bits.
     return gl.inline_asm_elementwise(
         "v_readfirstlane_b32 $0, $1",
         "=s,v",
-        [value],
+        [value.to(gl.int32)],
         dtype=gl.int32,
         is_pure=True,
         pack=1,

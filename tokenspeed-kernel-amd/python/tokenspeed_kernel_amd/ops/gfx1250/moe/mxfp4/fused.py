@@ -949,7 +949,12 @@ def _matmul(
 
     descriptor_m = M
     if not cfg.USE_GATHER:
-        descriptor_m = eM - off_m
+        # A TDM descriptor extent is a 32-bit row count, not an address. The
+        # expert base pointers above may need the wide index type because the
+        # expert weight slab can exceed the signed 32-bit range, but the rows
+        # remaining in this expert cannot, so narrowing is legal here and only
+        # here.
+        descriptor_m = (eM - off_m).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -1098,28 +1103,35 @@ def _matmul(
             layout=SCATTER_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(
-            address_index_type
-        )
+        # A descriptor offset is a 32-bit element coordinate inside the block
+        # grid, so it narrows here even though pid_n itself carries the wide
+        # address index type used for base-pointer arithmetic elsewhere.
+        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(gl.int32)
         y_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
         gl.amd.cdna5.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
         gl.amd.cdna5.tdm.async_wait(0)
     else:
-        offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
+        offs_y_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
             0, OUT_BLOCK_N, gl.SliceLayout(0, BLOCKED_LAYOUT_Y)
         )
-        mask_m = offs_y_m < eM
+        mask_m = offs_y_m < eM - off_m
         mask_n = offs_y_n < yN
 
-        Y_ptr += start_m * stride_y_m
+        Y_ptr += (start_m + off_m) * stride_y_m
 
+        # buffer_store takes an i32/u32 offset operand. Y_ptr above absorbs
+        # every term that can leave the 32-bit range -- start_z, the expert base
+        # start_m and this tile's own off_m -- so what is formed here spans one
+        # block tile and fits in 32 bits at any shape. Folding off_m into the
+        # pointer rather than into offs_y_m is what makes that bound hold: left
+        # here, the row term would instead grow with the expert's row count.
         y_offs = (
             offs_y_m.to(address_index_type)[:, None] * stride_y_m
             + offs_y_n.to(address_index_type)[None, :] * stride_y_n
-        )
+        ).to(gl.int32)
         y_mask = mask_m[:, None] & mask_n[None, :]
         gl.amd.cdna5.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
 
