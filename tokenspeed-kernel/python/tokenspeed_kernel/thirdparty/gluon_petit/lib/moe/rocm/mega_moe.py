@@ -118,16 +118,19 @@ def _MegaMoESolutions():
         3072,
         (P.kCta56, P.kCta192),
     )
-    for experts, topk in ((384, 6), (128, 3)):
-        register(
-            kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
-            8,
-            experts,
-            topk,
-            5120,
-            2560,
-            (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
-        )
+    # DeepSeek V4.1 Flash (384e/top6) and its dspark variant (128e/top3):
+    # register for EP4 and EP8. The ranks=8 entries are unchanged.
+    for ranks in (4, 8):
+        for experts, topk in ((384, 6), (128, 3)):
+            register(
+                kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
+                ranks,
+                experts,
+                topk,
+                5120,
+                2560,
+                (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
+            )
     return dict(entries)
 
 

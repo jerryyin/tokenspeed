@@ -237,6 +237,11 @@ class MegaMoeInputViews:
     expert_weights: torch.Tensor
 
 
+# Registered world sizes for the DeepSeek V4.1 Flash geometries. EP4 reuses
+# the EP8 tiles (the config selector is not keyed by world size; untuned).
+DEEPSEEK_V41_WORLD_SIZES = (4, 8)
+
+
 @dataclass(frozen=True)
 class MegaMoeConfig:
     world_size: int
@@ -307,7 +312,7 @@ class MegaMoeConfig:
             and activation_function is MegaMoeActivationFunction.kimi_situ
         )
         deepseek_v41_config = (
-            self.world_size == 8
+            self.world_size in DEEPSEEK_V41_WORLD_SIZES
             and (self.num_experts, self.topk) in ((384, 6), (128, 3))
             and self.model_dim == 5120
             and self.inter_dim == 2560

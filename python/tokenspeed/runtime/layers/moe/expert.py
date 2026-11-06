@@ -62,6 +62,11 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
+# Single-node EP world sizes Gluon Petit MegaMoE accepts. The kernel adapter
+# narrows this per model geometry (only DeepSeek V4.1 Flash is registered for
+# EP4; every other Petit geometry stays EP8-only).
+GLUON_PETIT_EP_WORLD_SIZES = (4, 8)
+
 
 class MoELayer(torch.nn.Module):
     def __init__(
@@ -293,8 +298,17 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "Gluon Petit MegaMoE requires MoE tensor parallel size 1"
                 )
-            if mapping.world_size != 8 or mapping.moe.ep_size != 8 or self.ep_size != 8:
-                raise ValueError("Gluon Petit MegaMoE requires world_size=ep_size=8")
+            if (
+                mapping.world_size not in GLUON_PETIT_EP_WORLD_SIZES
+                or mapping.moe.ep_size != mapping.world_size
+                or self.ep_size != mapping.world_size
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires world_size=ep_size in "
+                    f"{GLUON_PETIT_EP_WORLD_SIZES}; got world_size="
+                    f"{mapping.world_size}, moe.ep_size={mapping.moe.ep_size}, "
+                    f"layer ep_size={self.ep_size}"
+                )
             if (
                 global_server_args_dict["enable_eplb"]
                 or self.ep_num_redundant_experts

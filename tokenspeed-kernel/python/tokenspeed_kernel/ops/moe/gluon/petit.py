@@ -32,7 +32,10 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-_WORLD_SIZE = 8
+_WORLD_SIZE = 8  # EP8 reference world size; kept for callers and EP8 tests.
+# EP world sizes the adapter accepts. Each profile further restricts this to
+# the sizes that have a registered Petit geometry (see ``_profile_world_sizes``).
+SUPPORTED_WORLD_SIZES = (4, 8)
 _MAX_TOKENS_PER_RANK = 1024
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
@@ -114,6 +117,19 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     has_bias=False,
     activation="silu_clamped",
 )
+# Only the DeepSeek V4.1 Flash geometries are registered in Petit for EP4.
+# EP4 tiles reuse the EP8 tiles (the config selector is not keyed by world
+# size) and are untuned for EP4.
+_PROFILE_WORLD_SIZES = {
+    "dsv41_flash": (4, 8),
+    "dsv41_flash_dspark": (4, 8),
+}
+
+
+def _profile_world_sizes(profile: "_Profile") -> tuple[int, ...]:
+    return _PROFILE_WORLD_SIZES.get(profile.name, (_WORLD_SIZE,))
+
+
 _PROFILES = (
     _GPT_OSS_120B_PROFILE,
     _DSV4_PROFILE,
@@ -212,13 +228,19 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
             f"num_experts={w.num_experts}, top_k={w.top_k}, "
             f"hidden_size={w.hidden_size}, intermediate_size={w.intermediate_size}"
         )
+    world_sizes = _profile_world_sizes(profile)
+    if w.ep_size not in world_sizes:
+        raise ValueError(
+            f"Gluon Petit MegaMoE {profile.name} supports EP sizes "
+            f"{world_sizes}; got ep_size={w.ep_size}"
+        )
     if (
-        w.ep_size != _WORLD_SIZE
-        or w.tp_size != 1
-        or w.num_local_experts != profile.num_experts // _WORLD_SIZE
+        w.tp_size != 1
+        or w.num_local_experts != profile.num_experts // w.ep_size
     ):
         raise ValueError(
-            "Gluon Petit MegaMoE requires EP8, TP1 and contiguous expert shards"
+            f"Gluon Petit MegaMoE requires EP{w.ep_size}, TP1 and contiguous "
+            "expert shards"
         )
 
     if profile is _GPT_OSS_120B_PROFILE:
@@ -305,6 +327,8 @@ def _workspace_key(device: torch.device, profile: _Profile) -> tuple[int, _Profi
 
 
 def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
+    # The default world size is fixed for the life of the process, so the
+    # cache-hit path stays exactly as in the EP8-only adapter.
     key = _workspace_key(device, profile)
     workspace = _workspace_cache.get(key)
     if workspace is not None:
@@ -313,14 +337,17 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         raise RuntimeError(
             "Gluon Petit MegaMoE requires torch.distributed initialization"
         )
-    if dist.get_world_size() != _WORLD_SIZE:
+    world_size = dist.get_world_size()
+    world_sizes = _profile_world_sizes(profile)
+    if world_size not in world_sizes:
         raise RuntimeError(
-            "Gluon Petit MegaMoE requires the default distributed world size 8"
+            f"Gluon Petit MegaMoE {profile.name} requires a default distributed "
+            f"world size in {world_sizes}; got {world_size}"
         )
 
     petit_kernel = _import_petit_kernel()
     config = petit_kernel.MegaMoeConfig(
-        world_size=_WORLD_SIZE,
+        world_size=world_size,
         num_experts=profile.num_experts,
         topk=profile.top_k,
         model_dim=profile.model_dim,
@@ -335,7 +362,7 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         inter_dim=profile.inter_dim,
         has_bias=profile.has_bias,
     )
-    heap = petit_kernel.create_vmm_symmetric_heap(_WORLD_SIZE)
+    heap = petit_kernel.create_vmm_symmetric_heap(world_size)
     inputs = config.input_views(heap, _MAX_TOKENS_PER_RANK)
     workspace = _Workspace(config=config, heap=heap, inputs=inputs)
     _workspace_cache[key] = workspace
@@ -457,7 +484,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "a2a_backend": frozenset({"gluon_petit"}),
-        "ep_size": frozenset({_WORLD_SIZE}),
+        "ep_size": frozenset(SUPPORTED_WORLD_SIZES),
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"mxfp4"}),
         "supports_bias": frozenset({True}),
