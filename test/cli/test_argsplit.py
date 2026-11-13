@@ -330,3 +330,268 @@ def test_gateway_parser_rejects_extra_values_for_scalar_flag():
     with pytest.raises(SystemExit) as error:
         parse_router_args(["--worker-urls", "http://127.0.0.1:30000", *result.gateway])
     assert error.value.code == 2
+
+
+# --- check_argv / ``--check``: routing plus both real parsers ---------------------
+
+_RECIPE_LIKE = [
+    "serve",
+    "--model",
+    "/models/m",
+    "--attn-tp-size",
+    "4",
+    "--kv-cache-dtype",
+    "fp8",
+    "--cudagraph-capture-sizes",
+    "1",
+    "2",
+    "4",
+    "--reasoning-parser",
+    "passthrough",
+    "--tool-call-parser",
+    "passthrough",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "30000",
+    "--policy",
+    "round_robin",
+    "--engine-startup-timeout",
+    "7200",
+]
+
+
+def test_check_argv_routes_and_accepts_recipe_like_argv():
+    pytest.importorskip("smg")
+    from tokenspeed.cli._argsplit import check_argv
+
+    r = check_argv(_RECIPE_LIKE)
+    assert r["ok"], r
+    assert r["both"] == ["--model", "--reasoning-parser"]
+    routed = {row["flag"]: row["routed_to"] for row in r["routing"]}
+    assert routed["--attn-tp-size"] == "engine"
+    assert routed["--policy"] == "gateway"
+    assert routed["--engine-startup-timeout"] == "orchestrator"
+    assert r["orchestrator"]["engine_startup_timeout"] == 7200
+
+
+def test_check_argv_reports_flags_no_parser_knows():
+    pytest.importorskip("smg")
+    from tokenspeed.cli._argsplit import check_argv
+
+    r = check_argv([*_RECIPE_LIKE, "--no-enable-prefix-caching", "--control-port", "1"])
+    assert not r["ok"]
+    assert r["unknown"] == ["--control-port", "--no-enable-prefix-caching"]
+    assert "unrecognized arguments" in r["gateway_parser_error"]
+
+
+def test_check_argv_reports_engine_parser_rejection():
+    pytest.importorskip("smg")
+    from tokenspeed.cli._argsplit import check_argv
+
+    argv = list(_RECIPE_LIKE)
+    argv[argv.index("fp8")] = "fp16"
+    r = check_argv(argv)
+    assert not r["engine_parser_accepts"] and not r["ok"]
+    assert "invalid choice: 'fp16'" in r["engine_parser_error"]
+
+
+def test_check_cli_runs_without_a_visible_device(tmp_path):
+    """``--check`` (and split_argv) import ServerArgs with no GPU visible."""
+    pytest.importorskip("smg")
+    import inspect
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from tokenspeed.cli._argsplit import check_argv
+
+    recipe = tmp_path / "argv.json"
+    recipe.write_text(json.dumps({"layout": "t", "argv": _RECIPE_LIKE}))
+    env = dict(os.environ, HIP_VISIBLE_DEVICES="", CUDA_VISIBLE_DEVICES="")
+    env.pop("ROCR_VISIBLE_DEVICES", None)
+    out = subprocess.run(
+        [
+            sys.executable,
+            inspect.getfile(check_argv),
+            "--check",
+            "--argv-json",
+            str(recipe),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    r = json.loads(out.stdout)
+    assert r["ok"] and r["parser_platform"].startswith(("placeholder:", "detected:"))
+
+
+def _fake_serve_smg(monkeypatch, layout_fn):
+    import sys
+    import types
+
+    import tokenspeed.cli as cli_pkg
+
+    fake = types.ModuleType("tokenspeed.cli.serve_smg")
+    fake._args_with_default_model_parsers = lambda e, g: (list(e) + ["--x-default"], g)
+    fake._engine_layout = layout_fn
+    monkeypatch.setitem(sys.modules, "tokenspeed.cli.serve_smg", fake)
+    monkeypatch.setattr(cli_pkg, "serve_smg", fake, raising=False)
+
+
+def test_check_server_args_reports_layout(monkeypatch):
+    import types
+
+    from tokenspeed.cli._argsplit import check_server_args
+
+    seen = []
+
+    def layout(engine_args):
+        seen.append(engine_args)
+        return types.SimpleNamespace(count=4, remote_handshake=None)
+
+    _fake_serve_smg(monkeypatch, layout)
+    r = check_server_args(["--model", "m"], ["--model", "m"])
+    assert r == {
+        "server_args_ok": True,
+        "server_args_error": "",
+        "engine_layout": {"count": 4, "remote_handshake": None},
+    }
+    assert seen == [["--model", "m", "--x-default"]]
+
+
+def test_check_server_args_records_refusal_verbatim(monkeypatch):
+    from tokenspeed.cli._argsplit import check_server_args
+
+    def layout(engine_args):
+        raise ValueError("chunked_prefill_size must be <= max_prefill_tokens")
+
+    _fake_serve_smg(monkeypatch, layout)
+    r = check_server_args(["--model", "m"], [])
+    assert not r["server_args_ok"]
+    assert r["server_args_error"] == (
+        "ValueError: chunked_prefill_size must be <= max_prefill_tokens"
+    )
+    assert r["server_args_error_at"].endswith(
+        ".py:" + r["server_args_error_at"].rsplit(":", 1)[1]
+    )
+
+
+# --- check_moe_plans / ``--moe-plan``: TokenSpeed's MoE kernel selection ------------
+
+_V41_TEXT_CONFIG = {
+    "hidden_size": 5120,
+    "moe_intermediate_size": 2304,
+    "n_routed_experts": 384,
+    "num_experts_per_tok": 6,
+    "swiglu_limit": 10.0,
+    "dspark_n_routed_experts": 128,
+    "dspark_num_experts_per_tok": 3,
+}
+
+
+def _v41_model_dir(tmp_path):
+    import json
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"},
+                "text_config": _V41_TEXT_CONFIG,
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def _layout_argv(model: str, moe_tp: int, ep: int, *extra: str) -> list[str]:
+    return [
+        "--model",
+        model,
+        "--moe-tp-size",
+        str(moe_tp),
+        "--ep-size",
+        str(ep),
+        *extra,
+    ]
+
+
+def test_check_moe_plans_passes_layer_inputs_to_moe_plan(tmp_path, monkeypatch):
+    from tokenspeed.cli._argsplit import _ensure_parser_platform, check_moe_plans
+
+    _ensure_parser_platform()  # the kernel package needs a platform at import
+    import tokenspeed_kernel.ops.moe as kernel_moe
+
+    calls = []
+
+    def fake_plan(weight_dtype, **kwargs):
+        calls.append((weight_dtype, kwargs))
+        return {"apply_kernel_name": f"k{len(calls)}", "solution": "s"}
+
+    monkeypatch.setattr(kernel_moe, "moe_plan", fake_plan)
+    model = _v41_model_dir(tmp_path)
+    r = check_moe_plans(
+        _layout_argv(
+            model,
+            1,
+            4,
+            "--moe-backend",
+            "gluon_petit",
+            "--draft-moe-backend",
+            "gluon_petit",
+            "--all2all-backend",
+            "gluon_petit",
+        )
+    )["moe_plan"]
+    assert r["target"]["apply_kernel_name"] == "k1"
+    assert r["draft"]["apply_kernel_name"] == "k2"
+    (wt, target), (wd, draft) = calls
+    assert wt == wd == "mxfp4"
+    assert (target["num_experts"], target["top_k"]) == (384, 6)
+    assert (draft["num_experts"], draft["top_k"]) == (128, 3)
+    for kw in (target, draft):
+        assert kw["solution"] == "gluon" and kw["a2a_backend"] == "gluon_petit"
+        assert kw["internal_activation_dtype"] == "mxfp4"
+        assert kw["ep_size"] == 4 and kw["ispp"] == 2304 and kw["hidden"] == 5120
+        assert kw["activation"] == "swiglu" and kw["routing_mode"] == "precomputed_topk"
+        assert kw["activation_clamped"] is True and kw["swiglu_form"] == "standard"
+
+    calls.clear()
+    r = check_moe_plans(_layout_argv(model, 4, 1, "--moe-backend", "auto"))["moe_plan"]
+    assert [kw["solution"] for _, kw in calls] == [None, None]
+    assert [kw["ispp"] for _, kw in calls] == [576, 576]
+    assert [kw["a2a_backend"] for _, kw in calls] == ["none", "none"]
+
+
+def test_check_moe_plans_selects_gfx950_kernels(tmp_path):
+    """On gfx950 (placeholder or real) the selection matches the served kernels."""
+    from tokenspeed.cli._argsplit import _ensure_parser_platform, check_moe_plans
+
+    platform = _ensure_parser_platform()
+    if not platform.endswith("gfx950") and "-9.5" not in platform:
+        pytest.skip(f"selection is arch-specific; platform {platform}")
+    model = _v41_model_dir(tmp_path)
+    r = check_moe_plans(_layout_argv(model, 1, 4, "--moe-backend", "auto"))["moe_plan"]
+    # r0002-f3 tp4ep4 server log: "Kernel warmup covered draft experts
+    # model.layers.0.ffn (gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply, 128 experts)"
+    assert r["draft"]["apply_kernel_name"] == (
+        "gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply"
+    )
+    r = check_moe_plans(
+        _layout_argv(
+            model,
+            1,
+            4,
+            "--moe-backend",
+            "gluon_petit",
+            "--draft-moe-backend",
+            "gluon_petit",
+            "--all2all-backend",
+            "gluon_petit",
+        )
+    )["moe_plan"]
+    # round-1 EP4 Petit log: "(gluon_petit_mxfp4_megamoe_apply, 128 experts)"
+    assert r["draft"]["apply_kernel_name"] == "gluon_petit_mxfp4_megamoe_apply"
