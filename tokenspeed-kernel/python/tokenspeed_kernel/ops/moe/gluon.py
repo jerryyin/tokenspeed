@@ -2782,7 +2782,6 @@ if platform.is_amd:
 
 # TokenSpeed adapter for the vendored Gluon Petit MegaMoE kernels.
 
-_WORLD_SIZES = frozenset({4, 8})  # Petit's MegaMoeConfig narrows this per model.
 _MAX_TOKENS_PER_RANK = 1024
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
@@ -2806,6 +2805,8 @@ class _Profile:
     inter_dim: int
     has_bias: bool
     activation: str
+    # EP sizes Petit registers solutions for with this geometry.
+    world_sizes: frozenset[int] = frozenset({8})
 
 
 _GPT_OSS_120B_PROFILE = _Profile(
@@ -2847,6 +2848,7 @@ _DSV41_FLASH_PROFILE = _Profile(
     inter_dim=2560,
     has_bias=False,
     activation="silu_clamped",
+    world_sizes=frozenset({4, 8}),
 )
 _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     name="dsv41_flash_dspark",
@@ -2857,6 +2859,7 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     inter_dim=2560,
     has_bias=False,
     activation="silu_clamped",
+    world_sizes=frozenset({4, 8}),
 )
 _PROFILES = (
     _GPT_OSS_120B_PROFILE,
@@ -2865,6 +2868,13 @@ _PROFILES = (
     _DSV41_FLASH_PROFILE,
     _DSV41_FLASH_DSPARK_PROFILE,
 )
+# Union over profiles, for checks made before the model is known: kernel
+# selection and the runtime's MoELayer.
+GLUON_PETIT_WORLD_SIZES = frozenset().union(*(p.world_sizes for p in _PROFILES))
+
+
+def _join_sizes(sizes: frozenset[int]) -> str:
+    return "/".join(str(size) for size in sorted(sizes))
 
 
 @dataclass
@@ -2956,13 +2966,15 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
             f"num_experts={w.num_experts}, top_k={w.top_k}, "
             f"hidden_size={w.hidden_size}, intermediate_size={w.intermediate_size}"
         )
-    if (
-        w.ep_size not in _WORLD_SIZES
-        or w.tp_size != 1
-        or w.num_local_experts != profile.num_experts // w.ep_size
-    ):
+    if w.ep_size not in profile.world_sizes:
         raise ValueError(
-            "Gluon Petit MegaMoE requires EP4 or EP8, TP1 and contiguous expert shards"
+            f"Gluon Petit MegaMoE supports EP{_join_sizes(profile.world_sizes)} "
+            f"for {profile.name}; got EP{w.ep_size}"
+        )
+    if w.tp_size != 1 or w.num_local_experts != profile.num_experts // w.ep_size:
+        raise ValueError(
+            "Gluon Petit MegaMoE requires TP1 and contiguous expert shards; got "
+            f"tp_size={w.tp_size}, num_local_experts={w.num_local_experts}"
         )
 
     if profile is _GPT_OSS_120B_PROFILE:
@@ -3058,9 +3070,10 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
             "Gluon Petit MegaMoE requires torch.distributed initialization"
         )
     world_size = dist.get_world_size()
-    if world_size not in _WORLD_SIZES:
+    if world_size not in profile.world_sizes:
         raise RuntimeError(
-            "Gluon Petit MegaMoE requires the default distributed world size 4 or 8"
+            "Gluon Petit MegaMoE supports a default distributed world size of "
+            f"{_join_sizes(profile.world_sizes)} for {profile.name}; got {world_size}"
         )
 
     petit_kernel = _import_petit_kernel()
@@ -3202,7 +3215,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "a2a_backend": frozenset({"gluon_petit"}),
-        "ep_size": _WORLD_SIZES,
+        "ep_size": GLUON_PETIT_WORLD_SIZES,
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"mxfp4"}),
         "supports_bias": frozenset({True}),

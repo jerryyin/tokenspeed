@@ -27,12 +27,21 @@ when selecting a kernel plan.
 ## Runtime contract
 
 Select the backend with both `--moe-backend gluon_petit` and
-`--all2all-backend gluon_petit`. It requires one GFX950 node, EP8/TP1 (or EP4
-for DeepSeek V4.1 Flash), BF16 model activations, serialized MXFP4 expert weights, trivial expert placement, and no more than 1024 tokens per rank. The registered
-profiles are GPT-OSS 120B and the DeepSeek V4 expert geometry with unclamped SiLU.
-Checkpoints declaring a SiLU activation clamp are rejected because this kernel
-cannot preserve that activation. Explicit FP8 activation requests are also
+`--all2all-backend gluon_petit`. It requires one GFX950 node, EP8/TP1 (EP4/TP1
+is also accepted for the DeepSeek V4.1 Flash and DSpark geometries), BF16 model
+activations, serialized MXFP4 expert weights, trivial expert placement, and no
+more than 1024 tokens per rank. The registered profiles are GPT-OSS 120B, Kimi
+K3, the DeepSeek V4 expert geometry with unclamped SiLU, and DeepSeek V4.1 Flash
+(with its DSpark draft) with SiLU clamped at 10. DeepSeek V4 checkpoints that
+declare a SiLU activation clamp are rejected, because Petit registers only
+unclamped SiLU for that geometry. Explicit FP8 activation requests are also
 rejected; this backend quantizes activations to MXFP4.
+
+EP4 reuses the EP8 tiles. Measured on MI350X for DeepSeek V4.1 Flash with DSpark
+at about 50K tokens of context, EP4 decodes faster than TP4 at batch 32 and
+above and slower at batch 16 and below (0.62-0.85x). With prompts of 32K tokens
+or more it prefills slightly faster than TP4 once every GPU has a prompt, and at
+0.3x with a single prompt.
 
 ## Retained API
 
@@ -76,6 +85,9 @@ pytest tokenspeed-kernel/test/amd/ops/moe/test_gluon_petit_tensor.py \
 torchrun --standalone --nproc-per-node=8 -m pytest --import-mode=importlib \
   tokenspeed-kernel/test/amd/gfx950/ops/moe/test_gluon_petit_distributed.py
 ```
+
+With `--nproc-per-node=4` the distributed test runs the two DeepSeek V4.1
+profiles at EP4 and skips the others.
 
 The MFMA test compares all supported tile shapes and wave counts bit for bit
 against the original native instruction sequence.
