@@ -195,6 +195,12 @@ impl Shared {
         }
     }
 
+    // REVIEW-NOTE 2/9 (DP attention placement): picks the one attention-DP rank
+    // (GPU) that owns a request for its whole life, per request at run time: round
+    // robin, least in flight, or least cache use (Python passes `routing`). This is
+    // TokenSpeed's own client (used by WireDriver); under `ts serve` the bundled smg
+    // gateway places requests instead (compiled, least-loaded per the EP4 campaign).
+    // Either way one prompt runs its attention on one GPU under DP4.
     fn route(&self, request: &TokenizedGenerateReqInput) -> Result<usize> {
         let count = self.engines.len();
         let pinned = |rank: i64| {

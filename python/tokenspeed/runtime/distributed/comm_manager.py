@@ -423,6 +423,12 @@ class CommManager:
 
     # ---- Communication patterns ----
 
+    # REVIEW-NOTE 3/9 (the coupling rule): attention TP width vs MoE TP x EP group.
+    # Equal (TP4 attention + TP4 MoE): every rank already holds every token, the MoE
+    # computes this rank's share and post_moe_comm all-reduces the shares.
+    # Different (DP4 attention, attn_tp 1 + MoE group 4): pre_moe_comm all-gathers
+    # all ranks' tokens first and post_moe_comm reduce-scatters them back. Petit and
+    # MegaMoE skip both legs and exchange tokens themselves (notes 6-7).
     def use_all_reduce(self, is_moe: bool):
         if is_moe:
             return self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size

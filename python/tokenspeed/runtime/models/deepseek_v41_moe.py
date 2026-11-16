@@ -216,6 +216,8 @@ class DeepseekV4MoE(nn.Module):
         moe_backend = get_moe_backend()
         self.use_mega_moe = moe_backend.is_mega_moe()
         self.use_gluon_petit = moe_backend.is_gluon_petit()
+        # REVIEW-NOTE 6/9: Petit and MegaMoE fuse the token exchange into the MoE kernel,
+        # so the decoder must not gather or scatter tokens around them (note 7).
         self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
@@ -253,6 +255,10 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
+            # REVIEW-NOTE 5/9: without Petit or MegaMoE, DeepSeek V4.1's expert-parallel MoE
+            # accepts attention TP 1 (DP attention) or attention TP equal to the MoE group,
+            # so TP4 attention + EP4 MoE is a valid layout here. It was not measured in the
+            # EP4 vs TP4 comparison.
             if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "

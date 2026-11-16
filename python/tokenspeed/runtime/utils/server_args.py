@@ -1277,6 +1277,10 @@ class ServerArgs:
 
         # MoE parallel sizes default to consuming the full stage world unless
         # the user overrides them explicitly.
+        # REVIEW-NOTE 1/9 (layout sizing): attention and MoE are sized independently.
+        # Attention: world = attn_tp x attn_dp (above). MoE: ep_size from --ep-size, and
+        # moe_tp = world // ep_size. TP4 = attn_tp 4 + moe_tp 4; EP4 = attn_dp 4 +
+        # ep 4. Nothing here forces the pairs; notes 3, 5 and 8 decide what is allowed.
         moe_ep_size = 1 if self.ep_size is None else self.ep_size
         moe_tp_size = (
             stage_world_size // moe_ep_size
@@ -2562,6 +2566,11 @@ class ServerArgs:
                     "Gluon Petit MegaMoE requires --dtype bfloat16; "
                     f"configured dtype={self.dtype}"
                 )
+            # REVIEW-NOTE 8/9 (why EP4 means DP4 attention): Petit expects each rank to bring
+            # distinct tokens. TP attention would leave identical copies on every rank and
+            # Petit would send each token once per rank, so Petit requires attention and
+            # dense TP 1. The checks below cap each rank at 1024 tokens per step (decode
+            # rows and prefill chunk), Petit's per-rank buffer limit (note 9).
             if self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1:
                 raise ValueError(
                     "Gluon Petit MegaMoE requires attention TP1 and dense TP1"

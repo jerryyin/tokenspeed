@@ -2305,6 +2305,9 @@ class DeepseekV41DecoderLayer(nn.Module):
         ctx = self._ffn_context(ctx)
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
+        # REVIEW-NOTE 7/9: Petit / MegaMoE path. Each rank passes only its own tokens
+        # (possibly none) straight to the MoE, which sends them to the experts' ranks and
+        # returns the results; pre_mlp_comm / post_mlp_comm below are skipped.
         if self.ffn.owns_ep_communication:
             if defer_reduce:
                 raise ValueError(

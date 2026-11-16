@@ -155,6 +155,9 @@ class MoELayer(torch.nn.Module):
             ep_rank, ep_size = 0, 1
         self.ep_rank, self.ep_size = ep_rank, ep_size
 
+        # REVIEW-NOTE 4/9: one MoE layer is either tensor parallel (every rank holds a
+        # slice of every expert) or expert parallel (each rank holds whole experts),
+        # never both.
         if tp_size > 1 and ep_size > 1:
             raise ValueError("Mixed TP and EP is not supported yet.")
 

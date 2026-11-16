@@ -2783,6 +2783,8 @@ if platform.is_amd:
 # TokenSpeed adapter for the vendored Gluon Petit MegaMoE kernels.
 
 _WORLD_SIZES = frozenset({4, 8})  # Petit's MegaMoeConfig narrows this per model.
+# REVIEW-NOTE 9/9: Petit's per-rank token buffer size. It is why one 50K prompt
+# is prefilled in 49 steps of 1024 tokens on its one GPU (note 2).
 _MAX_TOKENS_PER_RANK = 1024
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
