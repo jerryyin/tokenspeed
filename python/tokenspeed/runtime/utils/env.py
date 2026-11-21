@@ -104,6 +104,7 @@ global_server_args_dict: dict = {
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
+    "gluon_petit_max_tokens_per_rank": None,
 }
 
 
@@ -189,6 +190,9 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
             "all2all_backend": server_args.all2all_backend,
             "deepep_mode": server_args.deepep_mode,
+            "gluon_petit_max_tokens_per_rank": (
+                server_args.gluon_petit_max_tokens_per_rank()
+            ),
         }
     )
 
