@@ -91,6 +91,28 @@ def EstimatedReceivedExperts(num_rows_global, top_k, num_experts, num_ranks):
     return min(local, max(1, int(round(local * touched))))
 
 
+def ReceivedExpertsBounds(num_rows_global, top_k, num_experts, num_ranks):
+    """``(low, high)`` distinct experts one rank receives rows for in a call.
+
+    ``low`` is ``EstimatedReceivedExperts`` (uniform random routing, with
+    collisions); ``high`` is the collision-free count
+    ``min(local, ceil(rows * top_k / num_ranks))``, which is what routing
+    that spreads a call's routes over distinct experts delivers (the
+    synthetic ``--routing test`` of the Petit tests and ``petit_layer.py``
+    does up to all local experts). Real routing has collisions and skew, so a
+    serving call lands at or below ``high``; whether it stays at or above
+    ``low`` is what logging ``distinct_local_experts`` in a serving decode
+    step must show.
+    """
+    rows = int(num_rows_global)
+    if rows <= 0:
+        return 0, 0
+    local = num_experts // num_ranks
+    high = min(local, -(-rows * top_k // num_ranks))
+    low = EstimatedReceivedExperts(rows, top_k, num_experts, num_ranks)
+    return min(low, high), high
+
+
 def Stage1N128PaysForExperts(experts, tiles_per_expert, num_ctas):
     """Whether half-width (N=128) stage-1 tiles take fewer tile rounds.
 
@@ -274,11 +296,17 @@ class MegaMoESolutionAdapter:
         C = self.Config
         if C.kSolution.bias_dtype != FusedMoEDataType.kNone:
             return False
-        experts = EstimatedReceivedExperts(
+        # N=128 only when the tile-round rule takes it at every received-expert
+        # count the call can deliver, from the collision estimate to the
+        # collision-free count: the rule flips every 13 experts above one
+        # round, and a wrong N=128 costs more than a right one saves (R=64:
+        # estimate 61 -> N=128, delivered 96 -> +13.2 us per call, r0002-f3).
+        low, high = ReceivedExpertsBounds(
             num_rows_global, C.kTopK, C.kNumExperts, C.kNumRanks
         )
-        return Stage1N128PaysForExperts(
-            experts, C.kInterDim // C.kStage1GroupN, C.kNumSMs
+        return high > 0 and all(
+            Stage1N128PaysForExperts(e, C.kInterDim // C.kStage1GroupN, C.kNumSMs)
+            for e in range(low, high + 1)
         )
 
     def SelectStage1N128(self, num_tokens, stage1_n128):

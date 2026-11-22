@@ -945,6 +945,101 @@ def test_stage1_n128_selector_by_received_experts(profile, expected) -> None:
         assert launches == [None] * (2 * len(off_counts))
 
 
+def _synthetic_received_experts(profile_name, counts):
+    """Distinct local experts each rank receives under the Petit tests'
+    synthetic routing (``_routing`` of test_gluon_petit_distributed.py, the
+    ``--routing test`` of petit_layer.py), for per-rank row ``counts``."""
+    import importlib.util
+    import pathlib
+    import sys
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "amd/gfx950/ops/moe/test_gluon_petit_distributed.py"
+    )
+    spec = importlib.util.spec_from_file_location("_petit_distributed_routing", path)
+    module = sys.modules.get(spec.name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    profile = module._PROFILES[profile_name]
+    ws, local = len(counts), profile.experts // len(counts)
+    received = [set() for _ in counts]
+    for rank, count in enumerate(counts):
+        ids, _ = module._routing(count, rank, profile, ws, torch.device("cpu"))
+        for expert in ids.flatten().tolist():
+            received[expert // local].add(expert)
+    return [len(r) for r in received]
+
+
+def _selector_cases():
+    """Every decode count r0002-f3 measured, and rows 1-64 in both layouts:
+    DP4 (all rows on one rank) and tp4ep4 (replicated rows split in
+    ceil(R/4) chunks), for the target and the DSpark draft."""
+    cases = []
+    for profile in ("dsv41_flash", "dsv41_flash_dspark"):
+        for rows in range(1, 65):
+            chunk = -(-rows // 4)
+            cases.append((profile, "dp4", [rows, 0, 0, 0]))
+            cases.append(
+                (profile, "tp4ep4", [max(0, min(chunk, rows - i * chunk)) for i in range(4)])
+            )
+    return cases
+
+
+def selector_table():
+    """Rows of (profile, layout, counts, estimate, collision-free, delivered
+    per rank, old decision, new decision, right decision at the delivered
+    counts). Print with ``python3 -c`` from the test directory."""
+    import sys
+
+    _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    shapes = {"dsv41_flash": (384, 6), "dsv41_flash_dspark": (128, 3)}
+    tiles, ctas = 2560 // 256, 256
+    rows = []
+    for profile, layout, counts in _selector_cases():
+        experts, top_k = shapes[profile]
+        total = sum(counts)
+        estimate = module.EstimatedReceivedExperts(total, top_k, experts, 4)
+        low, high = module.ReceivedExpertsBounds(total, top_k, experts, 4)
+        delivered = _synthetic_received_experts(profile, counts)
+        old = module.Stage1N128PaysForExperts(estimate, tiles, ctas)
+        new = high > 0 and all(
+            module.Stage1N128PaysForExperts(e, tiles, ctas)
+            for e in range(low, high + 1)
+        )
+        right = {module.Stage1N128PaysForExperts(e, tiles, ctas) for e in delivered if e}
+        rows.append((profile, layout, counts, estimate, high, delivered, old, new, right))
+    return rows
+
+
+def test_stage1_n128_selector_right_at_synthetic_counts() -> None:
+    """The fixed selector (``ReceivedExpertsBounds``: N=128 only where the
+    tile-round rule takes it from the collision estimate to the
+    collision-free count) never takes N=128 where the rule at the delivered
+    per-rank count says N=256, at rows 1-64 in DP4 and tp4ep4 for the target
+    and the draft; it keeps the measured wins (DP4/tp4ep4 b1, b4) and fixes
+    the measured loss (R=64: estimate 61, delivered 96, r0002-f3)."""
+    table = selector_table()
+    for profile, layout, counts, _, high, delivered, _, new, right in table:
+        if new:
+            assert right == {True}, (profile, layout, counts, delivered)
+        assert max(delivered) <= high + 1, (profile, layout, counts, delivered)
+    by = {(p, l, sum(c)): (old, new) for p, l, c, _, _, _, old, new, _ in table}
+    assert by[("dsv41_flash", "dp4", 64)] == (True, False)  # the f3 miss
+    assert by[("dsv41_flash", "tp4ep4", 64)] == (True, False)
+    assert by[("dsv41_flash", "tp4ep4", 32)] == (True, False)  # measured tie
+    for layout in ("dp4", "tp4ep4"):
+        assert by[("dsv41_flash", layout, 6)] == (True, True)  # b1 win kept
+        assert by[("dsv41_flash", layout, 24)] == (True, True)  # b4 win kept
+        assert by[("dsv41_flash", layout, 12)] == (False, False)  # b2
+    assert by[("dsv41_flash_dspark", "tp4ep4", 24)] == (False, False)  # draft 6x4
+
+
 @pytest.mark.parametrize("selected", (None, True, False))
 @pytest.mark.parametrize("do_finalize", (True, False))
 def test_apply_passes_call_wide_stage1_tile(selected, do_finalize) -> None:
