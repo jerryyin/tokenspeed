@@ -213,6 +213,10 @@ def shared_expert_stream(
 
 
 class DeepseekV4MoE(nn.Module):
+    # Set in __init__; the class default keeps layers built without it (tests
+    # assembling a layer by hand) on the existing paths.
+    petit_tp_attention = False
+
     def __init__(
         self,
         config: PretrainedConfig,
