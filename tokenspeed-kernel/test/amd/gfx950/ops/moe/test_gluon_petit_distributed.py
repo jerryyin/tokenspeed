@@ -1010,9 +1010,11 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
     n128_max = _petit_launch_module().kStage1N128MaxTokens
     if n128_max >= 0:
         # C5 on: counts up to the threshold take the N=128 stage-1 tile, so the
-        # first count above it starts another variant.
+        # first count above it in each integer class (plain, multiple of 16)
+        # starts another variant.
+        first_div16 = (n128_max // 16 + 1) * 16
         expected = {
-            name: tuple(sorted({*values, n128_max + 1}))
+            name: tuple(sorted({*values, n128_max + 1, first_div16}))
             for name, values in expected.items()
         }
     assert counts == expected[profile_name]

@@ -93,8 +93,12 @@ def test_ep4_dsv41_variant_counts(experts, top_k, expected, capacity) -> None:
     module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
     if module.kStage1N128MaxTokens >= 0:
         # C5 (TOKENSPEED_PETIT_STAGE1_N128) on: the first count above its
-        # threshold leaves the N=128 stage-1 tile, one more variant.
-        expected = tuple(sorted({*expected, module.kStage1N128MaxTokens + 1}))
+        # threshold, in each Triton integer class (plain and multiple of 16),
+        # leaves the N=128 stage-1 tile: one more variant each.
+        first_div16 = (module.kStage1N128MaxTokens // 16 + 1) * 16
+        expected = tuple(
+            sorted({*expected, module.kStage1N128MaxTokens + 1, first_div16})
+        )
     assert _config(4, experts, top_k, capacity).variant_token_counts() == expected
 
 

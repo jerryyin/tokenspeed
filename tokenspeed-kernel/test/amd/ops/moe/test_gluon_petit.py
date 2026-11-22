@@ -820,7 +820,9 @@ def test_stage1_n128_switch_selects_tile_and_variants(profile) -> None:
             geometry, tile = config.launch_choice(n)
             assert geometry == off_choice[n][0]
             assert tile == ("m32_n128" if n <= 8 else "m32")
-        assert config.variant_token_counts() == tuple(sorted({*off_counts, 9}))
+        # The first count above the threshold in each Triton integer class
+        # (plain 9, multiple-of-16 16) leaves the N=128 tile.
+        assert config.variant_token_counts() == tuple(sorted({*off_counts, 9, 16}))
         adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
         s1, s2, combine = adapter.Kernels(True, False, False, True, n128=True)
         b1, b2, b_combine = adapter.Kernels(True, False, False, True)
