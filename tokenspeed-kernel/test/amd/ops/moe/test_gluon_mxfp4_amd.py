@@ -550,16 +550,24 @@ def _make_precomputed_mxfp4_moe_module(
 # gluon_mxfp_precomputed_mxfp4_fused_moe finalizes an EP shard on its direct
 # decode (rows 1-2) and package prefill (rows >= 9) paths; rows 3-8 (6 is one
 # request's speculative verify) take its deferred direct decode, finalized by
-# the registration.
+# the registration (eager tensor ops, or with
+# TOKENSPEED_A4W4_EP_FUSED_FINALIZE=1 the one-launch ep_route_finalize).
+@pytest.mark.parametrize("fused_finalize", [False, True], ids=["eager", "fused"])
 @pytest.mark.parametrize("num_tokens", [1, 2, 3, 6, 8, 9, 12, 40])
-def test_precomputed_ep_apply_shards_sum_to_tp_apply(num_tokens: int) -> None:
+def test_precomputed_ep_apply_shards_sum_to_tp_apply(
+    num_tokens: int, fused_finalize: bool, monkeypatch
+) -> None:
     """The opt-in EP registration (exchange-free EP: every rank sees every
     token) over 4 contiguous expert shards sums to the TP registration over
     all experts, matches the dequantized reference, and replays in a CUDA
-    graph bit for bit."""
+    graph bit for bit; the fused finalize equals the eager one within one
+    BF16 rounding of the FP32 sum."""
     if not is_cdna4():
         pytest.skip("The gfx950 precomputed A4W4 MoE is unavailable on this GPU")
+    import tokenspeed_kernel.ops.moe.gluon as gluon_moe
     from tokenspeed_kernel.ops.moe import moe_apply
+
+    monkeypatch.setattr(gluon_moe, "_A4W4_EP_FUSED_FINALIZE", fused_finalize)
 
     generator = torch.Generator(device="cuda").manual_seed(20261122)
     num_experts, ep_size, top_k = 16, 4, 3
@@ -620,6 +628,15 @@ def test_precomputed_ep_apply_shards_sum_to_tp_apply(num_tokens: int) -> None:
     ).clone()
     eager = [run_ep(rank).clone() for rank in range(ep_size)]
     torch.cuda.synchronize()
+    if fused_finalize:
+        monkeypatch.setattr(gluon_moe, "_A4W4_EP_FUSED_FINALIZE", False)
+        unfused = [run_ep(rank).clone() for rank in range(ep_size)]
+        monkeypatch.setattr(gluon_moe, "_A4W4_EP_FUSED_FINALIZE", True)
+        torch.cuda.synchronize()
+        for rank in range(ep_size):
+            torch.testing.assert_close(
+                eager[rank].float(), unfused[rank].float(), atol=1e-6, rtol=2**-8
+            )
 
     # Each shard computes exactly its own routes: zero where a token routes to
     # none of its experts.
