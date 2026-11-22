@@ -312,6 +312,7 @@ class TestDeepseekV4Config:
 
         moe = SimpleNamespace(
             use_mega_moe=False,
+            use_gluon_petit=False,
             petit_tp_attention=False,
             n_shared_experts=1,
             shared_experts=shared_experts,
