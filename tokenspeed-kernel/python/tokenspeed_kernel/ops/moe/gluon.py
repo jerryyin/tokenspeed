@@ -2890,6 +2890,16 @@ if platform.is_amd:
             out=getattr(w, "_situ_output_buffer", None),
         )
 
+    # Opt-in (TOKENSPEED_A4W4_EP_FUSED_FINALIZE=1): the EP registration below
+    # finalizes the deferred direct decode's routes (rows 3-8, e.g. one
+    # request's 6 speculative-verify rows) with one kernel
+    # (tokenspeed_kernel_amd ... mxfp4/ep_route_finalize.py) instead of six
+    # eager tensor ops: the same FP32 products and accumulation, summed in
+    # slot order. Off keeps the eager ops.
+    _A4W4_EP_FUSED_FINALIZE = (
+        os.environ.get("TOKENSPEED_A4W4_EP_FUSED_FINALIZE", "0") == "1"
+    )
+
     # Opt-in EP sibling of gluon_mxfp4_precomputed_moe_apply: the same A4W4
     # kernel and weight preprocessing over an EP rank's contiguous expert range
     # (global top-k ids; the kernel skips routes to other ranks' experts), for
@@ -3011,6 +3021,14 @@ if platform.is_amd:
         if not deferred:
             return result
         routes, _, route_map = result
+        if _A4W4_EP_FUSED_FINALIZE:
+            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.ep_route_finalize import (
+                ep_route_finalize,
+            )
+
+            return ep_route_finalize(
+                routes, route_map, topk_weights, out_dtype=out_dtype, out=out
+            )
         top_k = int(topk_ids.shape[1])
         local = (route_map >= 0).view(rows, top_k, 1)
         routes = torch.where(local, routes.view(rows, top_k, -1).float(), 0.0)
