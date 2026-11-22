@@ -83,6 +83,9 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     assert plan["a2a_backend"] == "gluon_petit"
     # Per-route consumers take the unsummed routes.
     assert plan["supports_deferred_finalize"]
+    # C1 in the serving step: the router stores its weights in the plan's
+    # dtype, which must be Petit's FP32 so Petit reads them in place (no cast).
+    assert plan["topk_weights_dtype"] == torch.float32
 
 
 def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
