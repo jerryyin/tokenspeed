@@ -623,6 +623,24 @@ def test_distributed_petit_replicated_rows_split(profile_name):
         dist.barrier()
 
 
+def _collective_check(device, check) -> None:
+    """Run ``check`` on every rank and fail every rank together.
+
+    A rank that failed alone would leave its peers spinning inside Petit's
+    next collective; this all-reduces a failure flag first.
+    """
+    error = None
+    try:
+        check()
+    except AssertionError as exc:
+        error = exc
+    flag = torch.tensor([0 if error is None else 1], device=device, dtype=torch.int32)
+    dist.all_reduce(flag)
+    if error is not None:
+        raise error
+    assert int(flag.item()) == 0, f"{int(flag.item())} other rank(s) failed"
+
+
 def _graph_kernel_nodes(capture) -> int:
     """Kernel nodes of one captured graph (hipGraphDebugDotPrint's DOT)."""
     import re
@@ -739,14 +757,22 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
                     del graph
                     dist.barrier()
                 off, on = outputs[False], outputs[True]
-                torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
-                torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
-                for a, b in zip(on[2], off[2]):
-                    torch.testing.assert_close(a, b, atol=0, rtol=0)
-                torch.testing.assert_close(on[2][0], off[0], atol=0, rtol=0)
-                if count:
-                    expected = _reference(x, ids, weights, profile)
-                    torch.testing.assert_close(on[0], expected, atol=2e-6, rtol=8e-3)
+
+                def check():
+                    torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
+                    torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
+                    for a, b in zip(on[2], off[2]):
+                        torch.testing.assert_close(a, b, atol=0, rtol=0)
+                    torch.testing.assert_close(on[2][0], off[0], atol=0, rtol=0)
+                    if count and weight_dtype == torch.float32:
+                        # The reference takes FP32 weights; BF16-rounded
+                        # weights are checked bit for bit against the copies.
+                        expected = _reference(x, ids, weights, profile)
+                        torch.testing.assert_close(
+                            on[0], expected, atol=2e-6, rtol=8e-3
+                        )
+
+                _collective_check(device, check)
                 dist.barrier()
         # Nodes per call (int32 ids, FP32 weights; one busy row per rank).
         counts = [1] * ws
@@ -760,9 +786,15 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
             nodes[fused] = _graph_kernel_nodes(lambda: call(x, ids, weights, counts))
             torch.cuda.synchronize()
             dist.barrier()
-        print(f"[fuse_prep] rank {rank} {profile_name} graph nodes per call "
-              f"off={nodes[False]} on={nodes[True]}")
-        assert nodes[True] == nodes[False] - 2, nodes
+        print(
+            f"[fuse_prep] rank {rank} {profile_name} graph nodes per call "
+            f"off={nodes[False]} on={nodes[True]}"
+        )
+
+        def check_nodes():
+            assert nodes[True] == nodes[False] - 2, nodes
+
+        _collective_check(device, check_nodes)
     finally:
         petit._PETIT_FUSE_PREP = initial
 
