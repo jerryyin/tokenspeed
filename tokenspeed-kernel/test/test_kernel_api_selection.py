@@ -4544,6 +4544,157 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
     assert plan["apply_kernel_name"] == kernel_name
 
 
+def _gluon_mxfp4_swiglu_precomputed_plan(
+    platform: PlatformInfo,
+    *,
+    ep_size: int,
+    solution: str | None,
+    input_dtype: torch.dtype = torch.bfloat16,
+    ispp: int = 2304,
+    hidden: int | None = 5120,
+    num_experts: int | None = 384,
+    top_k: int | None = 6,
+    with_bias: bool = False,
+) -> dict:
+    real_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        return kernel_moe_plan(
+            "mxfp4",
+            input_dtype=input_dtype,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=ep_size,
+            ispp=ispp,
+            internal_activation_dtype="input",
+            solution=solution,
+            hidden=hidden,
+            num_experts=num_experts,
+            top_k=top_k,
+            with_bias=with_bias,
+            swiglu_form="standard",
+            activation_clamped=True,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+            features=frozenset(),
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+# DeepSeek V4.1 Flash routed experts (384, top-6) and its DSpark draft (128,
+# top-3); intermediate 2304, hidden 5120, MoE TP1 under EP.
+_DSV41_TARGET_AND_DRAFT_MOE = [(384, 6), (128, 3)]
+
+
+@pytest.mark.parametrize("num_experts,top_k", _DSV41_TARGET_AND_DRAFT_MOE)
+@pytest.mark.parametrize("ep_size", [2, 4, 8])
+def test_gluon_a4w4_ep_backend_selects_precomputed_ep_registration(
+    mi350_platform: PlatformInfo,
+    ep_size: int,
+    num_experts: int,
+    top_k: int,
+) -> None:
+    """--moe-backend gluon_a4w4_ep runs TP4's A4W4 kernel on an EP shard."""
+    kernel_name = "gluon_mxfp4_precomputed_ep_moe_apply"
+    if KernelRegistry.get().get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    plan = _gluon_mxfp4_swiglu_precomputed_plan(
+        mi350_platform,
+        ep_size=ep_size,
+        solution="gluon_a4w4_ep",
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    assert plan["apply_kernel_name"] == kernel_name
+    assert plan["solution"] == "gluon_a4w4_ep"
+
+
+@pytest.mark.parametrize("num_experts,top_k", _DSV41_TARGET_AND_DRAFT_MOE)
+@pytest.mark.parametrize(
+    "ep_size,solution,kernel_name",
+    [
+        (1, None, "gluon_mxfp4_precomputed_moe_apply"),
+        (1, "gluon", "gluon_mxfp4_precomputed_moe_apply"),
+        (4, None, "gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply"),
+        (4, "gluon", "gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply"),
+        (8, None, "gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply"),
+        (8, "gluon", "gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply"),
+    ],
+)
+def test_gluon_a4w4_ep_registration_leaves_default_selection(
+    mi350_platform: PlatformInfo,
+    ep_size: int,
+    solution: str | None,
+    kernel_name: str,
+    num_experts: int,
+    top_k: int,
+) -> None:
+    """Without the opt-in backend, TP (ep 1) and EP layouts keep their kernel."""
+    if KernelRegistry.get().get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    plan = _gluon_mxfp4_swiglu_precomputed_plan(
+        mi350_platform,
+        ep_size=ep_size,
+        solution=solution,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    assert plan["apply_kernel_name"] == kernel_name
+
+
+def test_gluon_a4w4_ep_registration_never_wins_automatic_selection(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """Over every MoE apply request its traits admit, automatic selection
+    picks the same kernel with and without the opt-in EP registration."""
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_mxfp4_precomputed_ep_moe_apply"
+    spec = registry.get_by_name(kernel_name)
+    if spec is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    assert spec.priority < Priority.PORTABLE
+
+    def selection(**request) -> str:
+        try:
+            return _gluon_mxfp4_swiglu_precomputed_plan(mi350_platform, **request)[
+                "apply_kernel_name"
+            ]
+        except kernel_NoKernelFoundError:
+            return "<none>"
+
+    requests = [
+        dict(
+            ep_size=ep_size,
+            solution=solution,
+            input_dtype=input_dtype,
+            ispp=ispp,
+            with_bias=with_bias,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+        for ep_size in (1, 2, 4, 8)
+        for solution in (None, "gluon")
+        for input_dtype in (torch.bfloat16, torch.float16)
+        for ispp in (2304, 576, 96)
+        for with_bias in (False, True)
+        for num_experts, top_k in _DSV41_TARGET_AND_DRAFT_MOE
+    ]
+    chosen = [selection(**request) for request in requests]
+    assert kernel_name not in chosen
+    snapshot = registry.snapshot()
+    try:
+        registry._unregister(kernel_name)
+        without = [selection(**request) for request in requests]
+    finally:
+        registry.restore(snapshot)
+    assert chosen == without
+
+
 @pytest.mark.parametrize("ep_size,ispp", [(4, 4096), (8, 4096), (1, 512)])
 def test_gluon_mxfp4_a4w4_deferred_traits_select_matching_kernel(
     mi350_platform: PlatformInfo,

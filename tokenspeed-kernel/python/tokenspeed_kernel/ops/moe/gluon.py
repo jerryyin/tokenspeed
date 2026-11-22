@@ -2888,6 +2888,108 @@ if platform.is_amd:
             out=getattr(w, "_situ_output_buffer", None),
         )
 
+    # Opt-in EP sibling of gluon_mxfp4_precomputed_moe_apply: the same A4W4
+    # kernel and weight preprocessing over an EP rank's contiguous expert range
+    # (global top-k ids; the kernel skips routes to other ranks' experts), for
+    # expert parallelism without a token exchange (attention TP, every rank
+    # holds all tokens, the attention all-reduce sums the ranks' partial
+    # outputs). It is its own solution, so only ``--moe-backend gluon_a4w4_ep``
+    # (and ``--draft-moe-backend gluon_a4w4_ep``) asks for it, and its priority
+    # sits below every in-tree band, so automatic selection never prefers it:
+    # configurations that do not ask for it keep their kernel
+    # (test/test_kernel_api_selection.py).
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_precomputed_ep_moe_apply",
+        solution="gluon_a4w4_ep",
+        weight_preprocessor=gluon_mxfp4_gfx950_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ep_size": frozenset({2, 4, 8}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.REFERENCE + 1,
+    )
+    def gluon_mxfp4_precomputed_ep_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del do_finalize, enable_pdl
+        if topk_weights is None or topk_ids is None:
+            raise ValueError(
+                "gluon_mxfp4_precomputed_ep_moe_apply requires topk_weights and "
+                "topk_ids"
+            )
+        num_experts = int(getattr(w, "num_experts"))
+        num_local_experts = int(getattr(w, "num_local_experts"))
+        ep_rank = int(getattr(w, "ep_rank"))
+        ep_size = int(getattr(w, "ep_size"))
+        if num_local_experts * ep_size != num_experts or not 0 <= ep_rank < ep_size:
+            raise ValueError(
+                "gluon_mxfp4_precomputed_ep_moe_apply requires an even, contiguous "
+                f"EP expert split; got {num_experts} experts, {num_local_experts} "
+                f"local, ep_rank {ep_rank} of {ep_size}"
+            )
+        swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        w13_precision_config = w.w13_precision_config
+        w2_precision_config = w.w2_precision_config
+
+        return gluon_mxfp_precomputed_mxfp4_fused_moe(
+            x,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            w.w2_weight_triton_tensor,
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
+            w13_mx_scale=w13_precision_config.b_mx_scale,
+            w2_mx_scale=w2_precision_config.b_mx_scale,
+            expert_start=ep_rank * num_local_experts,
+            global_num_experts=int(getattr(w, "num_experts")),
+            do_finalize=True,
+            x_quantized=None,
+            out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+            out=getattr(w, "_situ_output_buffer", None),
+        )
+
     def gluon_mxfp4_a4w4_moe_weights_gfx950(plan: dict, w: torch.nn.Module) -> None:
         del plan
         preprocess_n16_mxfp4_weights(w)

@@ -517,6 +517,175 @@ def test_dynamic_mxfp4_deferred_ep(
     )
 
 
+def _planned_mxfp4_apply(apply_name: str) -> dict:
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import SelectedKernel
+
+    impl = KernelRegistry.get().get_impl(apply_name)
+    if impl is None:
+        pytest.skip(f"{apply_name} is unavailable")
+    return {
+        "apply_kernel_name": apply_name,
+        "apply_kernel": SelectedKernel(apply_name, impl),
+        "features": frozenset(),
+    }
+
+
+def _make_precomputed_mxfp4_moe_module(
+    raw: dict[str, torch.Tensor],
+    *,
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+) -> torch.nn.Module:
+    module = _make_mxfp4_moe_module(raw)
+    module.swiglu_arg = SimpleNamespace(alpha=None, limit=7.0)
+    module.num_experts = num_experts
+    module.num_local_experts = raw["w13_weight"].shape[0]
+    module.ep_rank, module.ep_size = ep_rank, ep_size
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
+    return module
+
+
+# Rows 1 and 6 take the direct decode path (<= 8 rows), 12 and 40 the
+# package prefill path (>= 9 rows) of gluon_mxfp_precomputed_mxfp4_fused_moe.
+@pytest.mark.parametrize("num_tokens", [1, 6, 12, 40])
+def test_precomputed_ep_apply_shards_sum_to_tp_apply(num_tokens: int) -> None:
+    """The opt-in EP registration (exchange-free EP: every rank sees every
+    token) over 4 contiguous expert shards sums to the TP registration over
+    all experts, matches the dequantized reference, and replays in a CUDA
+    graph bit for bit."""
+    if not is_cdna4():
+        pytest.skip("The gfx950 precomputed A4W4 MoE is unavailable on this GPU")
+    from tokenspeed_kernel.ops.moe import moe_apply
+
+    generator = torch.Generator(device="cuda").manual_seed(20261122)
+    num_experts, ep_size, top_k = 16, 4, 3
+    num_local = num_experts // ep_size
+    hidden_size = intermediate_size = 256
+    raw = make_mxfp4_moe_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        generator=generator,
+    )
+    tp_module = _make_precomputed_mxfp4_moe_module(
+        raw, num_experts=num_experts, ep_rank=0, ep_size=1
+    )
+    ep_modules = [
+        _make_precomputed_mxfp4_moe_module(
+            {
+                name: tensor[rank * num_local : (rank + 1) * num_local]
+                for name, tensor in raw.items()
+            },
+            num_experts=num_experts,
+            ep_rank=rank,
+            ep_size=ep_size,
+        )
+        for rank in range(ep_size)
+    ]
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    scores = torch.rand((num_tokens, num_experts), device="cuda", generator=generator)
+    topk_weights, topk_ids = torch.topk(scores, top_k, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = topk_ids.to(torch.int32)
+
+    tp_plan = _planned_mxfp4_apply("gluon_mxfp4_precomputed_moe_apply")
+    ep_plan = _planned_mxfp4_apply("gluon_mxfp4_precomputed_ep_moe_apply")
+
+    def run_ep(rank: int) -> torch.Tensor:
+        return moe_apply(
+            ep_plan,
+            hidden_states,
+            ep_modules[rank],
+            None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+
+    tp_output = moe_apply(
+        tp_plan,
+        hidden_states,
+        tp_module,
+        None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    ).clone()
+    eager = [run_ep(rank).clone() for rank in range(ep_size)]
+    torch.cuda.synchronize()
+
+    # Each shard computes exactly its own routes: zero where a token routes to
+    # none of its experts.
+    for rank, partial in enumerate(eager):
+        owned = ((topk_ids // num_local) == rank).any(dim=1)
+        assert torch.all(partial[~owned] == 0)
+    ep_sum = torch.stack([p.float() for p in eager]).sum(dim=0)
+    torch.testing.assert_close(ep_sum, tp_output.float(), atol=2e-2, rtol=2e-2)
+
+    w13 = dequantize_mxfp4(raw["w13_weight"], raw["w13_scale"])
+    w2 = dequantize_mxfp4(raw["w2_weight"], raw["w2_scale"])
+    hidden = _dequantize_dynamic_mxfp4(hidden_states)
+    expected = torch.zeros((num_tokens, hidden_size), device="cuda")
+    for token in range(num_tokens):
+        for slot in range(top_k):
+            expert = int(topk_ids[token, slot])
+            gate_up = F.linear(hidden[token].float(), w13[expert].float())
+            gate = gate_up[0::2].clamp(max=7.0).to(torch.bfloat16).float()
+            linear = gate_up[1::2].clamp(-7.0, 7.0).to(torch.bfloat16).float()
+            inter = (gate * torch.sigmoid(gate)).to(torch.bfloat16).float() * linear
+            inter = _dequantize_dynamic_mxfp4(inter.to(torch.bfloat16)[None])[0]
+            expected[token] += (
+                topk_weights[token, slot].float()
+                * F.linear(inter.float(), w2[expert].float()).to(torch.bfloat16).float()
+            )
+    torch.testing.assert_close(ep_sum, expected, atol=6e-2, rtol=6e-2)
+
+    graphs, graph_outputs = [], []
+    for rank in range(ep_size):
+        run_ep(rank)  # warm up outside capture
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_outputs.append(run_ep(rank))
+        graphs.append(graph)
+    for graph in graphs:
+        graph.replay()
+    torch.cuda.synchronize()
+    for rank in range(ep_size):
+        torch.testing.assert_close(graph_outputs[rank], eager[rank], atol=0, rtol=0)
+
+
+def test_precomputed_ep_apply_rejects_uneven_expert_split() -> None:
+    if not is_cdna4():
+        pytest.skip("The gfx950 precomputed A4W4 MoE is unavailable on this GPU")
+    from tokenspeed_kernel.ops.moe import moe_apply
+
+    generator = torch.Generator(device="cuda").manual_seed(20261122)
+    raw = make_mxfp4_moe_weights(
+        num_experts=2, hidden_size=256, intermediate_size=256, generator=generator
+    )
+    module = _make_precomputed_mxfp4_moe_module(
+        raw, num_experts=16, ep_rank=0, ep_size=4
+    )
+    x = torch.zeros((1, 256), dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros((1, 3), dtype=torch.int32, device="cuda")
+    weights = torch.full((1, 3), 1 / 3, device="cuda")
+    with pytest.raises(ValueError, match="contiguous EP expert split"):
+        moe_apply(
+            _planned_mxfp4_apply("gluon_mxfp4_precomputed_ep_moe_apply"),
+            x,
+            module,
+            None,
+            topk_weights=weights,
+            topk_ids=ids,
+        )
+
+
 def test_static_fp8_activation_moe_gfx950_smoke() -> None:
     if not is_cdna4():
         pytest.skip("gfx950 is required for the CDNA4 static FP8 MoE kernel")
