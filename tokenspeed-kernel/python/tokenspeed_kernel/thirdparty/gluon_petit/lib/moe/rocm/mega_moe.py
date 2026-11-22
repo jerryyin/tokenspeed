@@ -37,20 +37,76 @@ from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
 
 
+def _stage1_n128_by_experts() -> bool:
+    """C5 selector: ``TOKENSPEED_PETIT_STAGE1_N128_SELECT=experts`` (with
+    ``TOKENSPEED_PETIT_STAGE1_N128=1``) chooses the N=128 stage-1 tile from the
+    number of distinct experts a rank is estimated to receive in the call
+    (``Stage1N128ForGlobalRows``), passed down by the caller the same on every
+    rank, instead of this rank's own row count.
+    """
+    return (
+        os.environ.get("TOKENSPEED_PETIT_STAGE1_N128", "0") == "1"
+        and os.environ.get("TOKENSPEED_PETIT_STAGE1_N128_SELECT", "rows") == "experts"
+    )
+
+
+kStage1N128ByExperts = _stage1_n128_by_experts()
+
+
 def _stage1_n128_max_tokens() -> int:
     """C5 switch: per-rank row counts up to this launch the N=128 stage-1 tile.
 
     ``TOKENSPEED_PETIT_STAGE1_N128=1`` turns it on (read once at import) with
     ``TOKENSPEED_PETIT_STAGE1_N128_MAX_ROWS`` rows (default 8: batch-1 DP4,
     batch 1-4 tp4ep4-petit); off (the default) returns -1 and every count
-    keeps the 256-column tile.
+    keeps the 256-column tile. With the received-experts selector the row rule
+    is off (-1) and only the caller's ``stage1_n128`` picks the tile.
     """
     if os.environ.get("TOKENSPEED_PETIT_STAGE1_N128", "0") != "1":
+        return -1
+    if _stage1_n128_by_experts():
         return -1
     return int(os.environ.get("TOKENSPEED_PETIT_STAGE1_N128_MAX_ROWS", "8"))
 
 
 kStage1N128MaxTokens = _stage1_n128_max_tokens()
+
+
+def EstimatedReceivedExperts(num_rows_global, top_k, num_experts, num_ranks):
+    """Distinct experts one rank is expected to receive rows for in a call.
+
+    ``num_rows_global`` rows are routed once each (DP4: every rank's rows;
+    attention TP: the replicated rows, split over the ranks), each to
+    ``top_k`` distinct experts. Under uniform routing an expert is touched
+    with probability ``1 - (1 - top_k / num_experts) ** rows``, so a rank's
+    ``num_experts / num_ranks`` local experts expect that fraction touched.
+    For few rows this is ``rows * top_k / num_ranks`` (no collisions). The
+    value depends only on call-wide counts, so every rank gets the same one.
+    """
+    rows = int(num_rows_global)
+    if rows <= 0:
+        return 0
+    local = num_experts // num_ranks
+    touched = 1.0 - (1.0 - top_k / num_experts) ** rows
+    return min(local, max(1, int(round(local * touched))))
+
+
+def Stage1N128PaysForExperts(experts, tiles_per_expert, num_ctas):
+    """Whether half-width (N=128) stage-1 tiles take fewer tile rounds.
+
+    At decode counts each touched expert has one 32-row block, so stage 1
+    runs ``t = experts * tiles_per_expert`` N=256 tiles (``2 t`` half-width
+    tiles) on ``num_ctas`` CTAs, and its time is set by per-CTA tile rounds
+    (r0002-pg). N=256 takes ``ceil(t / C)`` full rounds, N=128
+    ``ceil(2 t / C)`` half rounds, which is ``2 ceil(t / C) - 1`` (a saving
+    of half a round) exactly when ``0 < t mod C <= C / 2``; otherwise both
+    take the same time and the larger tile is kept. DSv4.1 Flash at EP4
+    (10 tiles per expert, 256 CTAs): N=128 for 1-12, 26-38, 52-64 and 77-89
+    experts.
+    """
+    tiles = int(experts) * int(tiles_per_expert)
+    rem = tiles % num_ctas
+    return tiles > 0 and 0 < rem <= num_ctas // 2
 
 
 @dataclass
@@ -75,6 +131,9 @@ class MegaMoEParams:
     # [topk, hidden] rows.
     reduce_routes: bool
     stream: object = None
+    # C5 tile chosen by the caller for the whole call (received-experts
+    # selector); None keeps the per-rank row rule.
+    stage1_n128: object = None
 
 
 @dataclass(frozen=True)
@@ -192,17 +251,42 @@ class MegaMoESolutionAdapter:
         C = self.Config
         return num_tokens >= C.kM64MinTokens, num_tokens >= C.kM64W8MinTokens
 
-    def Stage1N128(self, num_tokens):
-        """Whether ``num_tokens`` rows take the N=128 stage-1 tile (C5, opt-in).
-
-        Only bias-free solutions (DSv4.1 Flash and its DSpark draft among
-        them) take it; biased solutions keep their tile.
-        """
+    def Stage1N128Admits(self, num_tokens):
+        """Whether this rank's ``num_tokens`` rows can launch the N=128 tile:
+        the 32-row stage-1 tile and a bias-free solution (DSv4.1 Flash and its
+        DSpark draft among them; biased solutions keep their tile)."""
         return (
-            num_tokens <= kStage1N128MaxTokens
-            and num_tokens < self.Config.kM64MinTokens
+            num_tokens < self.Config.kM64MinTokens
             and self.Config.kSolution.bias_dtype == FusedMoEDataType.kNone
         )
+
+    def Stage1N128(self, num_tokens):
+        """Whether ``num_tokens`` rows take the N=128 stage-1 tile (C5, opt-in)."""
+        return num_tokens <= kStage1N128MaxTokens and self.Stage1N128Admits(
+            num_tokens
+        )
+
+    def Stage1N128ForGlobalRows(self, num_rows_global):
+        """The received-experts selector's call-wide N=128 decision, or None
+        when the selector is off (the row rule then decides per rank)."""
+        if not kStage1N128ByExperts:
+            return None
+        C = self.Config
+        if C.kSolution.bias_dtype != FusedMoEDataType.kNone:
+            return False
+        experts = EstimatedReceivedExperts(
+            num_rows_global, C.kTopK, C.kNumExperts, C.kNumRanks
+        )
+        return Stage1N128PaysForExperts(
+            experts, C.kInterDim // C.kStage1GroupN, C.kNumSMs
+        )
+
+    def SelectStage1N128(self, num_tokens, stage1_n128):
+        """The tile a launch takes: the caller's call-wide choice when given
+        (still only where this rank's count admits it), else the row rule."""
+        if stage1_n128 is None:
+            return self.Stage1N128(num_tokens)
+        return bool(stage1_n128) and self.Stage1N128Admits(num_tokens)
 
     def GetWorkspaceInfo(self, rank):
         W, C = self.Workspace, self.Config
@@ -250,7 +334,7 @@ class MegaMoESolutionAdapter:
         ):
             return kFusedMoEErrorInvalidArgument
         m64, w8 = self.Stage1Tile(p.num_tokens)
-        if self.Stage1N128(p.num_tokens):
+        if self.SelectStage1N128(p.num_tokens, p.stage1_n128):
             stage1, _, _ = self.Kernels(
                 external_input_count == 3, m64, w8, p.reduce_routes, n128=True
             )
@@ -350,6 +434,15 @@ def MegaMoECompute(params, solution_id, compile_only=False):
     if not IsGfx950(params.stream, params.workspace.device):
         return kFusedMoEErrorUnsupported
     return adapter.Invoke(params, compile_only)
+
+
+def MegaMoEStage1N128ForGlobalRows(solution_id, num_rows_global):
+    """The received-experts selector's N=128 choice for a call routing
+    ``num_rows_global`` rows (None when the selector is off)."""
+    adapter = _MegaMoESolution(int(solution_id))
+    if adapter is None:
+        raise ValueError("unsupported MegaMoE solution_id")
+    return adapter.Stage1N128ForGlobalRows(int(num_rows_global))
 
 
 def GetMegaMoEWorkspaceInfo(rank, solution_id):

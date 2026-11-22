@@ -833,3 +833,172 @@ def test_stage1_n128_switch_selects_tile_and_variants(profile) -> None:
         # The 64-row tiles keep their counts whatever the threshold.
         assert config.launch_choice(480)[1] == "m64_w4" or profile is not _DSV41_FLASH_PROFILE
         assert config.launch_choice(1009)[1] == "m64_w8"
+
+
+def test_stage1_n128_received_experts_rule() -> None:
+    """C5 selector: N=128 pays when it saves half a tile round (pure rule)."""
+    import lib.moe.rocm.mega_moe as forwarding
+
+    _import_petit_kernel()
+    pays = forwarding.Stage1N128PaysForExperts
+    # DSv4.1 Flash at EP4: 2560 / 256 = 10 N=256 tiles per expert, 256 CTAs.
+    chosen = [e for e in range(0, 97) if pays(e, 10, 256)]
+    assert chosen == [
+        *range(1, 13),
+        *range(26, 39),
+        *range(52, 65),
+        *range(77, 90),
+    ]
+    estimate = forwarding.EstimatedReceivedExperts
+    # rows, top_k, experts, ranks -> expected distinct local experts
+    assert estimate(0, 6, 384, 4) == 0
+    assert estimate(6, 6, 384, 4) == 9  # DP4 / tp4ep4 batch 1 (1 + 5 draft)
+    assert estimate(12, 6, 384, 4) == 17  # batch 2
+    assert estimate(24, 6, 384, 4) == 30  # batch 4
+    assert estimate(10_000, 6, 384, 4) == 96  # capped at the local experts
+    assert estimate(24, 3, 128, 4) == 14  # DSpark draft, 6 rows on 4 ranks
+    # Few rows: rows * top_k / ranks (no collisions).
+    assert estimate(2, 6, 384, 4) == 3
+
+
+@pytest.mark.parametrize(
+    "profile,expected",
+    [
+        (
+            _DSV41_FLASH_PROFILE,
+            {0: False, 4: True, 6: True, 8: True, 12: False, 18: False, 24: True,
+             48: False, 96: False},
+        ),
+        (
+            _DSV41_FLASH_DSPARK_PROFILE,
+            {0: False, 4: True, 6: True, 12: True, 24: False, 48: False},
+        ),
+    ],
+)
+def test_stage1_n128_selector_by_received_experts(profile, expected) -> None:
+    """C5 with TOKENSPEED_PETIT_STAGE1_N128_SELECT=experts: one call-wide tile
+    from the collective's row count; the row rule is off, a rank still takes
+    N=128 only where its own count admits the 32-row tile; the warmup compiles
+    the N=128 tile for every 32-row-tile count."""
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, profile, 4, 1024)
+    with mock.patch.object(module, "kStage1N128ByExperts", False):
+        assert config.stage1_n128_for_global_rows(6) is None
+    with (
+        mock.patch.object(module, "kStage1N128ByExperts", True),
+        mock.patch.object(module, "kStage1N128MaxTokens", -1),
+    ):
+        got = {rows: config.stage1_n128_for_global_rows(rows) for rows in expected}
+        assert got == expected
+        adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
+        min_m64 = adapter.Config.kM64MinTokens
+        assert adapter.SelectStage1N128(0, True)  # a 0-row rank follows the call
+        assert not adapter.SelectStage1N128(min_m64, True)  # 64-row tile kept
+        assert not adapter.SelectStage1N128(1, False)
+        assert not adapter.SelectStage1N128(1, None)  # no row rule
+        # Variant keys keep the switch-off set; compile_variants adds the
+        # N=128 tile for each 32-row-tile count.
+        off_counts = config.variant_token_counts()
+        launches = []
+        with mock.patch.object(
+            type(config), "_launch", side_effect=lambda *a, **k: launches.append(
+                (a[5], k["reduce_routes"], k["stage1_n128"])
+            )
+        ):
+            views = SimpleNamespace(
+                tokens=torch.empty((1024, 8)),
+                scales=torch.empty((1024, 1)),
+                expert_ids=torch.empty((1024, 1)),
+                expert_weights=torch.empty((1024, 1)),
+            )
+            config.compile_variants(
+                None, None, None, None, None, w13_bias=None, w2_bias=None,
+                inputs=views,
+            )
+        m32 = [n for n in off_counts if config.launch_choice(n)[1] == "m32"]
+        assert m32 and len(m32) < len(off_counts)
+        assert sorted({n for n, _, s in launches if s}) == m32
+        assert sorted({n for n, _, s in launches if s is None}) == list(off_counts)
+        assert len(launches) == 2 * (len(off_counts) + len(m32))
+    with (
+        mock.patch.object(module, "kStage1N128ByExperts", False),
+        mock.patch.object(module, "kStage1N128MaxTokens", -1),
+    ):
+        launches.clear()
+        with mock.patch.object(
+            type(config), "_launch", side_effect=lambda *a, **k: launches.append(
+                k["stage1_n128"]
+            )
+        ):
+            config.compile_variants(
+                None, None, None, None, None, w13_bias=None, w2_bias=None,
+                inputs=views,
+            )
+        assert launches == [None] * (2 * len(off_counts))
+
+
+@pytest.mark.parametrize("selected", (None, True, False))
+@pytest.mark.parametrize("do_finalize", (True, False))
+def test_apply_passes_call_wide_stage1_tile(selected, do_finalize) -> None:
+    """The apply asks the selector with num_tokens_global and passes its
+    answer to the launch unchanged (None: selector off, row rule)."""
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    profile = _Profile(
+        name="test",
+        num_experts=8,
+        top_k=2,
+        model_dim=64,
+        logical_intermediate=32,
+        inter_dim=32,
+        has_bias=False,
+        activation="silu",
+    )
+    heap = SimpleNamespace(
+        tokens=torch.empty((4, 32), dtype=torch.uint8),
+        scales=torch.empty((4, 2), dtype=torch.uint8),
+        expert_ids=torch.empty((4, 2), dtype=torch.int32),
+        expert_weights=torch.empty((4, 2), dtype=torch.float32),
+    )
+    config = mock.Mock()
+    config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
+    config.run_routes.side_effect = lambda *args, **kwargs: torch.empty(0)
+    config.stage1_n128_for_global_rows.return_value = selected
+    workspace = SimpleNamespace(config=config, heap=object(), inputs=heap)
+    layer = SimpleNamespace(
+        _moe_backend_state=_GluonPetitState(
+            profile=profile,
+            w13_weight=torch.empty(0),
+            w2_weight=torch.empty(0),
+            w13_scale=torch.empty(0),
+            w2_scale=torch.empty(0),
+            w13_bias=None,
+            w2_bias=None,
+        )
+    )
+    x = torch.zeros((1, profile.model_dim), dtype=torch.bfloat16)
+    with mock.patch(
+        "tokenspeed_kernel.ops.moe.gluon._get_workspace", return_value=workspace
+    ):
+        petit.gluon_petit_mxfp4_megamoe_apply(
+            plan={},
+            x=x,
+            w=layer,
+            router_logits=torch.empty((1, 0), dtype=torch.bfloat16),
+            topk_weights=torch.ones((1, 2), dtype=torch.float32),
+            topk_ids=torch.zeros((1, 2), dtype=torch.int32),
+            num_tokens_global=7,
+            max_num_tokens_per_gpu=4,
+            do_finalize=do_finalize,
+            enable_pdl=False,
+            low_latency=None,
+            overlap_fn=None,
+        )
+    config.stage1_n128_for_global_rows.assert_called_once_with(7)
+    launch = config.run if do_finalize else config.run_routes
+    assert launch.call_args.kwargs["stage1_n128"] is selected
