@@ -642,23 +642,37 @@ def _collective_check(device, check) -> None:
 
 
 def _graph_kernel_nodes(capture) -> int:
-    """Kernel nodes of one captured graph (hipGraphDebugDotPrint's DOT)."""
-    import re
-    import tempfile
+    """Nodes of the graph one ``capture()`` records (all node kinds).
 
+    Asks the HIP runtime this process already loaded for the capturing
+    stream's graph (hipStreamGetCaptureInfo_v2) and its node count
+    (hipGraphGetNodes) before the capture ends; torch's debug_dump needs the
+    cuda-bindings package, which ROCm wheels do not ship.
+    """
+    import ctypes
+
+    hip = ctypes.CDLL("libamdhip64.so.7")
     graph = torch.cuda.CUDAGraph()
-    graph.enable_debug_mode()
+    count = ctypes.c_size_t(0)
     with torch.cuda.graph(graph):
         capture()
-    with tempfile.TemporaryDirectory() as directory:
-        path = os.path.join(directory, "graph.dot")
-        graph.debug_dump(path)
-        text = Path(path).read_text()
-    # One "label" per graph node; memset/memcpy/event nodes are not kernels.
-    labels = re.findall(r'label="([^"]*)"', text)
-    kernels = [x for x in labels if "KERNEL" in x.upper() or "kernel" in x]
+        status, capture_id = ctypes.c_int(0), ctypes.c_ulonglong(0)
+        handle, deps, num_deps = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_size_t(0)
+        stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        assert (
+            hip.hipStreamGetCaptureInfo_v2(
+                stream,
+                ctypes.byref(status),
+                ctypes.byref(capture_id),
+                ctypes.byref(handle),
+                ctypes.byref(deps),
+                ctypes.byref(num_deps),
+            )
+            == 0
+        )
+        assert hip.hipGraphGetNodes(handle, None, ctypes.byref(count)) == 0
     graph.reset()
-    return len(kernels) if kernels else len(labels)
+    return int(count.value)
 
 
 @pytest.mark.skipif(
