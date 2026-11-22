@@ -1,9 +1,11 @@
 """Native MegaMoE solution registry, launch validation, and input quantizer."""
 
+import os
 from dataclasses import dataclass
 from functools import cache
 
 from lib.moe.rocm.fused_moe import (
+    FusedMoEDataType,
     FusedMoESolutionId,
     IsGfx950,
     MegaMoEProducerGeometry,
@@ -24,6 +26,7 @@ from lib.moe.rocm.mega_moe_config_selector import (
     MegaMoEConfigSelector,
     MegaMoEStage1M64W4Config,
     MegaMoEStage1M64W8Config,
+    MegaMoEStage1N128Config,
     kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
     kMegaMoETwoStageMxFp4KimiSituSolutionId,
     kMegaMoETwoStageMxFp4SiluSolutionId,
@@ -32,6 +35,22 @@ from lib.moe.rocm.mega_moe_config_selector import (
 from lib.moe.rocm.quantization import MxFp4Scale, NativeMxFp4Quantization
 from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
+
+
+def _stage1_n128_max_tokens() -> int:
+    """C5 switch: per-rank row counts up to this launch the N=128 stage-1 tile.
+
+    ``TOKENSPEED_PETIT_STAGE1_N128=1`` turns it on (read once at import) with
+    ``TOKENSPEED_PETIT_STAGE1_N128_MAX_ROWS`` rows (default 8: batch-1 DP4,
+    batch 1-4 tp4ep4-petit); off (the default) returns -1 and every count
+    keeps the 256-column tile.
+    """
+    if os.environ.get("TOKENSPEED_PETIT_STAGE1_N128", "0") != "1":
+        return -1
+    return int(os.environ.get("TOKENSPEED_PETIT_STAGE1_N128_MAX_ROWS", "8"))
+
+
+kStage1N128MaxTokens = _stage1_n128_max_tokens()
 
 
 @dataclass
@@ -151,12 +170,16 @@ class MegaMoESolutionAdapter:
         self.Workspace = MegaMoEWorkspace(self.Config)
 
     @cache
-    def Kernels(self, external, m64, w8, reduce_routes):
+    def Kernels(self, external, m64, w8, reduce_routes, n128=False):
         Config = self.Config
         SelectedStage1 = (
             MegaMoEStage1M64W8Config(Config)
             if w8
-            else MegaMoEStage1M64W4Config(Config) if m64 else Config
+            else (
+                MegaMoEStage1M64W4Config(Config)
+                if m64
+                else MegaMoEStage1N128Config(Config) if n128 else Config
+            )
         )
         return (
             MegaMoETwoStageCommComputeKernel(SelectedStage1, external),
@@ -168,6 +191,18 @@ class MegaMoESolutionAdapter:
         """Return the stage-1 tile flags ``(m64, w8)`` for a per-rank count."""
         C = self.Config
         return num_tokens >= C.kM64MinTokens, num_tokens >= C.kM64W8MinTokens
+
+    def Stage1N128(self, num_tokens):
+        """Whether ``num_tokens`` rows take the N=128 stage-1 tile (C5, opt-in).
+
+        Only bias-free solutions (DSv4.1 Flash and its DSpark draft among
+        them) take it; biased solutions keep their tile.
+        """
+        return (
+            num_tokens <= kStage1N128MaxTokens
+            and num_tokens < self.Config.kM64MinTokens
+            and self.Config.kSolution.bias_dtype == FusedMoEDataType.kNone
+        )
 
     def GetWorkspaceInfo(self, rank):
         W, C = self.Workspace, self.Config
@@ -215,9 +250,17 @@ class MegaMoESolutionAdapter:
         ):
             return kFusedMoEErrorInvalidArgument
         m64, w8 = self.Stage1Tile(p.num_tokens)
-        stage1, stage2, combine = self.Kernels(
-            external_input_count == 3, m64, w8, p.reduce_routes
-        )
+        if self.Stage1N128(p.num_tokens):
+            stage1, _, _ = self.Kernels(
+                external_input_count == 3, m64, w8, p.reduce_routes, n128=True
+            )
+            _, stage2, combine = self.Kernels(
+                external_input_count == 3, m64, w8, p.reduce_routes
+            )
+        else:
+            stage1, stage2, combine = self.Kernels(
+                external_input_count == 3, m64, w8, p.reduce_routes
+            )
         import torch
         from lib.streams import native_stream
 
@@ -322,6 +365,8 @@ def MegaMoEStage1Tile(solution_id, num_tokens):
     if adapter is None:
         raise ValueError("unsupported MegaMoE solution_id")
     m64, w8 = adapter.Stage1Tile(int(num_tokens))
+    if adapter.Stage1N128(int(num_tokens)):
+        return "m32_n128"
     return "m64_w8" if w8 else "m64_w4" if m64 else "m32"
 
 

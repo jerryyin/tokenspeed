@@ -797,3 +797,37 @@ def test_raised_capacity_is_carried_into_state_and_apply() -> None:
                 overlap_fn=None,
                 **kwargs,
             )
+
+
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+def test_stage1_n128_switch_selects_tile_and_variants(profile) -> None:
+    """C5 (TOKENSPEED_PETIT_STAGE1_N128): counts up to the threshold take the
+    32x128 stage-1 tile, a separate compile variant; stage 2 keeps its tile.
+    Off (-1, the default) every count keeps the old launch choice."""
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, profile, 4, 1024)
+    with mock.patch.object(module, "kStage1N128MaxTokens", -1):
+        off_counts = config.variant_token_counts()
+        off_choice = {n: config.launch_choice(n) for n in (0, 1, 6, 8, 9, 24)}
+    assert all(tile == "m32" for _, tile in off_choice.values())
+    with mock.patch.object(module, "kStage1N128MaxTokens", 8):
+        for n in (0, 1, 6, 8, 9, 24):
+            geometry, tile = config.launch_choice(n)
+            assert geometry == off_choice[n][0]
+            assert tile == ("m32_n128" if n <= 8 else "m32")
+        assert config.variant_token_counts() == tuple(sorted({*off_counts, 9}))
+        adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
+        s1, s2, combine = adapter.Kernels(True, False, False, True, n128=True)
+        b1, b2, b_combine = adapter.Kernels(True, False, False, True)
+        assert s1.kStage1TileCount == 2 * b1.kStage1TileCount
+        assert s1.cache_key != b1.cache_key
+        assert s2.cache_key == b2.cache_key and combine.cache_key == b_combine.cache_key
+    with mock.patch.object(module, "kStage1N128MaxTokens", 4096):
+        # The 64-row tiles keep their counts whatever the threshold.
+        assert config.launch_choice(480)[1] == "m64_w4" or profile is not _DSV41_FLASH_PROFILE
+        assert config.launch_choice(1009)[1] == "m64_w8"
