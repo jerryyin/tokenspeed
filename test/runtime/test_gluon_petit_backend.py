@@ -738,7 +738,15 @@ def _emulated_tp_attention_moe(rank: int, ep: int, shared_parts, calls):
                 do_finalize,
             )
         )
-        return torch.tanh(hidden_states) * topk_output
+        routed = torch.tanh(hidden_states) * topk_output
+        from tokenspeed_kernel.ops.moe import gluon as petit
+
+        if petit._PETIT_COMBINE_POST:
+            # C3: Petit's combine writes out = residual + routed rows.
+            residual, out, _ = petit._PETIT_COMBINE_POST[-1]
+            target = out if out is not None else torch.empty_like(routed)
+            return target.copy_(residual + routed)
+        return routed
 
     layer._compute_topk_output = topk
     layer.experts = experts
@@ -752,10 +760,20 @@ def _emulated_tp_attention_moe(rank: int, ep: int, shared_parts, calls):
 @pytest.mark.parametrize("with_shared", [True, False])
 @pytest.mark.parametrize("with_out", [True, False])
 @pytest.mark.parametrize("with_ids", [True, False])
+@pytest.mark.parametrize("fuse_post", [False, True])
 def test_petit_tp_attention_split_sum_matches_reference(
-    num_rows, with_shared, with_out, with_ids
+    num_rows, with_shared, with_out, with_ids, fuse_post
 ) -> None:
-    """The four ranks' partials sum (the all-reduce) to the reference MoE."""
+    """The four ranks' partials sum (the all-reduce) to the reference MoE,
+    with the slice add in the model and with C3 (TOKENSPEED_PETIT_FUSE_POST:
+    the routed rows added into the shared partial by Petit's combine)."""
+    from tokenspeed.runtime.models import deepseek_v41_moe
+
+    with mock.patch.object(deepseek_v41_moe, "_PETIT_FUSE_POST", fuse_post):
+        _check_petit_tp_attention_split_sum(num_rows, with_shared, with_out, with_ids)
+
+
+def _check_petit_tp_attention_split_sum(num_rows, with_shared, with_out, with_ids):
     ep, hidden = 4, 16
     generator = torch.Generator().manual_seed(num_rows)
     x = torch.randn(num_rows, hidden, generator=generator, dtype=torch.float64)
