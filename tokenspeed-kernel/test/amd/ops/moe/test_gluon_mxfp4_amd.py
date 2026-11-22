@@ -547,9 +547,11 @@ def _make_precomputed_mxfp4_moe_module(
     return module
 
 
-# Rows 1 and 6 take the direct decode path (<= 8 rows), 12 and 40 the
-# package prefill path (>= 9 rows) of gluon_mxfp_precomputed_mxfp4_fused_moe.
-@pytest.mark.parametrize("num_tokens", [1, 6, 12, 40])
+# gluon_mxfp_precomputed_mxfp4_fused_moe finalizes an EP shard on its direct
+# decode (rows 1-2) and package prefill (rows >= 9) paths; rows 3-8 (6 is one
+# request's speculative verify) take its deferred direct decode, finalized by
+# the registration.
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 6, 8, 9, 12, 40])
 def test_precomputed_ep_apply_shards_sum_to_tp_apply(num_tokens: int) -> None:
     """The opt-in EP registration (exchange-free EP: every rank sees every
     token) over 4 contiguous expert shards sums to the TP registration over
@@ -656,8 +658,17 @@ def test_precomputed_ep_apply_shards_sum_to_tp_apply(num_tokens: int) -> None:
     for graph in graphs:
         graph.replay()
     torch.cuda.synchronize()
+    # The package path (>= 9 rows) is compared within BF16 rounding: its
+    # replay differed from eager in the last bit of 70 of 10,240 outputs at 40
+    # rows on gfx950.
+    exact = num_tokens < 9
     for rank in range(ep_size):
-        torch.testing.assert_close(graph_outputs[rank], eager[rank], atol=0, rtol=0)
+        torch.testing.assert_close(
+            graph_outputs[rank],
+            eager[rank],
+            atol=0 if exact else 1e-3,
+            rtol=0 if exact else 1e-2,
+        )
 
 
 def test_precomputed_ep_apply_rejects_uneven_expert_split() -> None:

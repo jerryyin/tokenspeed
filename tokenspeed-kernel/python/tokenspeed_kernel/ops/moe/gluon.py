@@ -2957,11 +2957,28 @@ if platform.is_amd:
                 f"EP expert split; got {num_experts} experts, {num_local_experts} "
                 f"local, ep_rank {ep_rank} of {ep_size}"
             )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+            moe as _gfx950_fused_moe,
+        )
+
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_precision_config = w.w13_precision_config
         w2_precision_config = w.w2_precision_config
-
-        return gluon_mxfp_precomputed_mxfp4_fused_moe(
+        out_dtype = w2_precision_config.out_dtype or torch.bfloat16
+        out = getattr(w, "_situ_output_buffer", None)
+        rows = int(x.shape[0])
+        # The fused MoE finalizes an EP shard on its direct decode (at most
+        # _DIRECT_DECODE_MAX_M rows) and package prefill (at least
+        # _PACKAGE_PREFILL_MIN_M rows) paths only. Between them, e.g. one
+        # request's 6 speculative-verify rows, run its deferred direct decode,
+        # which serves EP shards up to _DEFERRED_DIRECT_DECODE_MAX_M rows, and
+        # weight and sum this rank's routes here.
+        deferred = (
+            _gfx950_fused_moe._DIRECT_DECODE_MAX_M
+            < rows
+            < _gfx950_fused_moe._PACKAGE_PREFILL_MIN_M
+        )
+        result = gluon_mxfp_precomputed_mxfp4_fused_moe(
             x,
             topk_weights,
             topk_ids,
@@ -2980,15 +2997,26 @@ if platform.is_amd:
             w13_mx_scale=w13_precision_config.b_mx_scale,
             w2_mx_scale=w2_precision_config.b_mx_scale,
             expert_start=ep_rank * num_local_experts,
-            global_num_experts=int(getattr(w, "num_experts")),
-            do_finalize=True,
+            global_num_experts=num_experts,
+            do_finalize=not deferred,
             x_quantized=None,
-            out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
+            out_dtype=out_dtype,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
-            out=getattr(w, "_situ_output_buffer", None),
+            out=None if deferred else out,
         )
+        if not deferred:
+            return result
+        routes, _, route_map = result
+        top_k = int(topk_ids.shape[1])
+        local = (route_map >= 0).view(rows, top_k, 1)
+        routes = torch.where(local, routes.view(rows, top_k, -1).float(), 0.0)
+        combined = (routes * topk_weights.view(rows, top_k, 1).float()).sum(dim=1)
+        if out is None:
+            return combined.to(out_dtype)
+        out.copy_(combined)
+        return out
 
     def gluon_mxfp4_a4w4_moe_weights_gfx950(plan: dict, w: torch.nn.Module) -> None:
         del plan
