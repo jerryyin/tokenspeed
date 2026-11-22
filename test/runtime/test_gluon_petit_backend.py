@@ -797,3 +797,56 @@ def test_petit_tp_attention_split_sum_matches_reference(
     assert [call[0] for call in calls] == list(range(ep))
     assert sum(call[1] for call in calls) == num_rows
     assert all(call[2:] == (num_rows, share, True) for call in calls)
+
+
+@pytest.mark.parametrize("splits,expected_rows", [(False, 8192), (True, 2048)])
+def test_draft_expert_warmup_takes_the_rank_share(splits, expected_rows) -> None:
+    """Startup warmup applies a row-splitting Petit draft layer to ceil(T/EP)."""
+    from tokenspeed.runtime.execution import model_executor
+
+    layer = MoELayer.__new__(MoELayer)
+    nn.Module.__init__(layer)
+    vars(layer).update(
+        plan={
+            "a2a_backend": "gluon_petit",
+            "solution": "gluon",
+            "apply_kernel_name": "gluon_petit_mxfp4_megamoe_apply",
+        },
+        hidden_size=8,
+        intermediate_size=16,
+        num_experts=8,
+        top_k=2,
+        ep_size=4,
+        input_dtype=torch.bfloat16,
+        prefix="draft.mlp.experts",
+    )
+    if splits:
+        layer.petit_splits_replicated_rows = True
+    executor = SimpleNamespace(
+        device=torch.device("cpu"),
+        drafter=SimpleNamespace(
+            draft_model_runner=SimpleNamespace(
+                model=SimpleNamespace(modules=lambda: [layer])
+            )
+        ),
+    )
+    calls = []
+    with (
+        mock.patch.object(
+            type(layer),
+            "supports_precomputed_topk",
+            new_callable=mock.PropertyMock,
+            return_value=True,
+        ),
+        mock.patch.object(
+            model_executor,
+            "kernel_moe_apply",
+            side_effect=lambda plan, x, w, logits, **kw: calls.append((x.shape, kw)),
+        ),
+    ):
+        model_executor.ModelExecutor._autotune_draft_experts(executor, 8192)
+    assert len(calls) == 1
+    shape, kwargs = calls[0]
+    assert shape == (expected_rows, 8)
+    assert kwargs["topk_ids"].shape == (expected_rows, 2)
+    assert kwargs["num_tokens_global"] == 8192

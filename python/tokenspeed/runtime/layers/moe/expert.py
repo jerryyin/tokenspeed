@@ -96,6 +96,9 @@ def moe_expert_weight_dtype(quant_config, prefix: str) -> str:
 
 
 class MoELayer(torch.nn.Module):
+    # Set in __init__; the class default covers layers assembled without it.
+    petit_splits_replicated_rows = False
+
     def __init__(
         self,
         top_k: int,
