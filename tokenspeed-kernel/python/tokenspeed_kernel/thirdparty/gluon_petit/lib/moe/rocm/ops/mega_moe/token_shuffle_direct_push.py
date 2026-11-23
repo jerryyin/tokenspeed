@@ -149,13 +149,23 @@ class DirectPushTokenShuffle(DeviceTemplate):
             state.input_topk_weights_,
         )
         parity, expected = epoch & 1, self.Expected(epoch)
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(state.workspace_, epoch, 0, 1, tid)
         owner = block == 0
         if owner:
             self.AdmitLaunch(state, tid, epoch)
+            if self.Workspace.kTrace:
+                self.Workspace.TraceStamp(state.workspace_, epoch, 0, 2, tid)
             self.PopulateSendCounters(state, tid, parity, expected)
+            if self.Workspace.kTrace:
+                self.Workspace.TraceStamp(state.workspace_, epoch, 0, 3, tid)
             self.BuildDestinationPlan(state, tid, wid, wtid, parity, expected)
+            if self.Workspace.kTrace:
+                self.Workspace.TraceStamp(state.workspace_, epoch, 0, 5, tid)
         elif block <= self.kProducerBlocks:
             self.WaitForOwnerAdmission(state, epoch, tid)
+            if self.Workspace.kTrace:
+                self.Workspace.TraceStamp(state.workspace_, epoch, 0, 2, tid)
             self.PushPayload(
                 state,
                 block - 1,
@@ -481,6 +491,11 @@ class DirectPushTokenShuffle(DeviceTemplate):
                 False,
             )
             compiler_memory_barrier()
+            if self.Workspace.kTrace:
+                # Site 4 (CountDone all seen): wave 0's lane 0 stores it.
+                self.Workspace.TraceStamp(
+                    state.workspace_, state.current_epoch_, 0, 4, plan_lane
+                )
             pool_rows = l.full((), 0, l.uint32)
             for i in l.static_range(self.kExpertsPerLane):
                 plan_expert = i * 64 + plan_lane
@@ -636,6 +651,8 @@ class DirectPushTokenShuffle(DeviceTemplate):
             expected.to(l.int32),
         )
         l.barrier()
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(state.workspace_, state.current_epoch_, 0, 3, tid)
         if kDispatchBlocks == 56 and kDispatchBlocks >= self.kNumRanks:
             kProducersPerDestination: l.constexpr = kDispatchBlocks // self.kNumRanks
             destination_producer = producer_slot // self.kNumRanks
@@ -780,6 +797,13 @@ class DirectPushTokenShuffle(DeviceTemplate):
                 )
         complete_scoped_vmem()
         l.barrier()
+        if self.Workspace.kTrace:
+            # Sites 4/5 of a producer: its last expert with rows (stores
+            # acknowledged, arrival bits sent).
+            if rows > 0:
+                self.Workspace.TraceStamp(
+                    state.workspace_, state.current_epoch_, 0, 4, tid
+                )
         first, end = pool_base + ordinal_begin, pool_base + ordinal_end
         for pool_block in tl.range(
             first // self.kSortedTokenBlock,
@@ -802,6 +826,11 @@ class DirectPushTokenShuffle(DeviceTemplate):
                 tid == 0,
             )
         l.barrier()
+        if self.Workspace.kTrace:
+            if rows > 0:
+                self.Workspace.TraceStamp(
+                    state.workspace_, state.current_epoch_, 0, 5, tid
+                )
 
     @device_method
     def LoadInputExpert(self, state, route):
