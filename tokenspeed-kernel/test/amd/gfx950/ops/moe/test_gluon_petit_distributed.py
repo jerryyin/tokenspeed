@@ -1502,18 +1502,36 @@ def test_distributed_petit_routes_follow_back_to_back_launches():
     copies them out with coherent loads, and an ordinary kernel reads every
     copy immediately, with no other traffic in between to evict cached lines.
     """
+    _routes_follow_back_to_back("muse_spark", 8, [1, 2, 3, 4, 1, 2, 3, 4])
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("counts", [[1, 2, 3, 4], [2, 2, 2, 0], [6, 0, 0, 0]])
+def test_distributed_petit_routes_follow_back_to_back_launches_ep4(counts):
+    """The back-to-back routes check at EP4 (DSv4.1 Flash), with tp4ep4's
+    2/2/2/0 split and DP4 batch 1's 6/0/0/0, under whatever Petit switches
+    the environment sets: C7 (TOKENSPEED_PETIT_COMBINE_NOBARRIER) moves the
+    routes' visibility from the combine's grid barrier to write-through
+    stores and stage 2's epoch publish, and C6 (TOKENSPEED_PETIT_DROP_ADMIT)
+    drops the launch admission, so run it with each switch on."""
+    _routes_follow_back_to_back("dsv41_flash", 4, counts)
+
+
+def _routes_follow_back_to_back(profile_name, ws, counts):
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group("nccl", timeout=timedelta(minutes=5))
     rank = dist.get_rank()
     device = torch.device("cuda", local_rank)
-    profile = _PROFILES["muse_spark"]
-    layer = _TestMoeLayer(profile, 8, device)
-    _weights(layer, profile, rank, 8)
-    plan = _make_plan(profile, 8)
+    profile = _PROFILES[profile_name]
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
     kernel_moe_process_weights(plan, layer)
-    counts = [1, 2, 3, 4, 1, 2, 3, 4]
     count = counts[rank]
     iterations = 48
     inputs = []
@@ -1524,7 +1542,7 @@ def test_distributed_petit_routes_follow_back_to_back_launches():
         x = ((((values * 13 + rank * 7 + step * 29) % 127) - 63).float() / 32).to(
             torch.bfloat16
         )
-        ids, weights = _routing(count, rank + step, profile, 8, device)
+        ids, weights = _routing(count, rank + step, profile, ws, device)
         inputs.append((x, ids, weights))
     x = torch.empty_like(inputs[0][0])
     ids = torch.empty_like(inputs[0][1])

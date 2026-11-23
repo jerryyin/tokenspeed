@@ -112,6 +112,19 @@ def _drop_admit() -> bool:
 kDropAdmit = _drop_admit()
 
 
+def _combine_no_barrier() -> bool:
+    """C7: ``TOKENSPEED_PETIT_COMBINE_NOBARRIER=1`` (read once at import).
+    Stage 2 writes routes with write-through system stores and its last tile
+    publishes the call's epoch to the peers (a local tile counter), so the
+    combine drops its 128-CTA system grid barrier and its own publish, and
+    a rank with 0 rows launches the combine with one CTA. Off (the default)
+    launches exactly the old kernels."""
+    return os.environ.get("TOKENSPEED_PETIT_COMBINE_NOBARRIER", "0") == "1"
+
+
+kCombineNoBarrier = _combine_no_barrier()
+
+
 def EstimatedReceivedExperts(num_rows_global, top_k, num_experts, num_ranks):
     """Distinct experts one rank is expected to receive rows for in a call.
 
@@ -301,7 +314,11 @@ class MegaMoESolutionAdapter:
         # Opt-in switches enter the selector (and its key) only when on.
         switches = {
             name: True
-            for name, on in (("kTrace", kPetitTrace), ("kDropAdmit", kDropAdmit))
+            for name, on in (
+                ("kTrace", kPetitTrace),
+                ("kDropAdmit", kDropAdmit),
+                ("kCombineNoBarrier", kCombineNoBarrier),
+            )
             if on
         }
         self.Config = MegaMoEConfigSelector(solution, **switches)
@@ -477,6 +494,14 @@ class MegaMoESolutionAdapter:
             # warmup() takes the grid as a keyword; a launch takes it above.
             return {"grid": blocks} if compile_only else {}
 
+        # C7: without the grid barrier a 0-row combine only waits for the
+        # peers' epochs, which one CTA does (the reducer returns at once).
+        combine_blocks = (
+            1
+            if getattr(C, "kCombineNoBarrier", False) and p.num_tokens == 0
+            else combine.kNumSMs
+        )
+
         with torch.cuda.stream(native_stream(p.stream, p.workspace.device)):
             Launch(MegaMoEStage1, (C.kNumSMs,))(
                 p.w13,
@@ -505,7 +530,7 @@ class MegaMoESolutionAdapter:
                 **Grid((stage2.kStage2GridBlocks,)),
             )
             if p.residual is None:
-                Launch(MegaMoECombine, (combine.kNumSMs,))(
+                Launch(MegaMoECombine, (combine_blocks,))(
                     p.out,
                     p.num_tokens,
                     p.output_row_stride,
@@ -514,7 +539,7 @@ class MegaMoESolutionAdapter:
                     combine,
                     num_warps=combine.kNumWarps,
                     enable_fp_fusion=False,
-                    **Grid((combine.kNumSMs,)),
+                    **Grid((combine_blocks,)),
                 )
             else:
                 assert combine.kAddResidual
@@ -522,7 +547,7 @@ class MegaMoESolutionAdapter:
                     # The shared expert runs on the aux stream: its rows
                     # must be complete before the combine reads them.
                     torch.cuda.current_stream().wait_event(p.residual_ready)
-                Launch(MegaMoECombineResidual, (combine.kNumSMs,))(
+                Launch(MegaMoECombineResidual, (combine_blocks,))(
                     p.out,
                     p.num_tokens,
                     p.output_row_stride,
@@ -533,7 +558,7 @@ class MegaMoESolutionAdapter:
                     combine,
                     num_warps=combine.kNumWarps,
                     enable_fp_fusion=False,
-                    **Grid((combine.kNumSMs,)),
+                    **Grid((combine_blocks,)),
                 )
         return 0
 

@@ -343,6 +343,13 @@ class MegaMoEWorkspace(DeviceTemplate):
         return self.kLocalOffsetBase
 
     @host_device
+    def Stage2DoneCounterOffset(self):
+        """C7: stage 2's local finished-tile counter, a spare word of the grid
+        sync cache line (slots 0..kMaxGridSyncSlots-1 and their epoch word
+        use its first bytes); the last tile resets it to 0."""
+        return self.GridSyncBarrierOffset() + self.kCacheLineBytes // 2
+
+    @host_device
     def DirectPushWorkHeadOffset(self, shard, head_set=0):
         return (
             self.GridSyncBarrierOffset()

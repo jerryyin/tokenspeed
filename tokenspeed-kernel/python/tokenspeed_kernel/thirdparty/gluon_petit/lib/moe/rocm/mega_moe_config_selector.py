@@ -83,7 +83,7 @@ from lib.tal.device import DeviceTemplate
 
 
 class MegaMoEConfigSelector(DeviceTemplate):
-    def __init__(self, Solution, kTrace=False, kDropAdmit=False):
+    def __init__(self, Solution, kTrace=False, kDropAdmit=False, kCombineNoBarrier=False):
         self._key = Solution.Repr()
         if kTrace:
             # TOKENSPEED_PETIT_TRACE: in the key (and the instance) only when
@@ -94,6 +94,10 @@ class MegaMoEConfigSelector(DeviceTemplate):
             # C6 (TOKENSPEED_PETIT_DROP_ADMIT): the same rule.
             self._key = (self._key, "drop-admit")
             self.kDropAdmit = True
+        if kCombineNoBarrier:
+            # C7 (TOKENSPEED_PETIT_COMBINE_NOBARRIER): the same rule.
+            self._key = (self._key, "combine-nobarrier")
+            self.kCombineNoBarrier = True
         self.kSolution = Solution
         self.kGroupM, self.kStage1GroupN = 32, 256
         self.kGroupN = 128 if Solution.W2TileShape() == MegaMoETileShape.kN128 else 256
