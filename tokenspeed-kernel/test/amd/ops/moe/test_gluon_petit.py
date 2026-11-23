@@ -681,6 +681,21 @@ _DEFAULT_CAPACITY_HEAP_BYTES = {
 }
 
 
+# The trace region (TOKENSPEED_PETIT_TRACE=1): 8 slots x 3 kernels x 256 rows
+# x 16 sites of u64 stamps plus the [2][8][64][2] u64 ping block, a whole
+# number of pages, appended after the page-aligned local data.
+_TRACE_REGION_BYTES = 8 * 3 * 256 * 16 * 8 + 2 * 8 * 64 * 2 * 8
+
+
+def _petit_trace_on() -> bool:
+    import sys
+
+    _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+
+    return bool(sys.modules[forwarding.MegaMoESolutionAdapter.__module__].kPetitTrace)
+
+
 @pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_default_capacity_keeps_solution_and_heap(profile, world_size) -> None:
@@ -690,9 +705,12 @@ def test_default_capacity_keeps_solution_and_heap(profile, world_size) -> None:
     # solution id, kernel constants and caches are today's.
     assert default._solution_id >> 52 == 0
     assert default.max_tokens_per_rank == 1024
-    assert default.heap_bytes() == _DEFAULT_CAPACITY_HEAP_BYTES[
-        (profile.name, world_size)
-    ]
+    # TOKENSPEED_PETIT_TRACE=1 (a measurement switch, read at import) appends
+    # exactly its page-aligned local region to both heap counts; off, the
+    # table holds unchanged.
+    heap = _DEFAULT_CAPACITY_HEAP_BYTES[(profile.name, world_size)]
+    trace = _TRACE_REGION_BYTES if _petit_trace_on() else 0
+    assert default.heap_bytes() == (heap[0] + trace, heap[1] + trace)
     assert gluon_petit_max_tokens_per_rank(world_size, 1) == 1024
     assert gluon_petit_max_tokens_per_rank(world_size, 1024) == 1024
 
