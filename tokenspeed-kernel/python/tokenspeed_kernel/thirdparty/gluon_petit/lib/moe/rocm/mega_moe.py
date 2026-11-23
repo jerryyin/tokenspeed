@@ -100,6 +100,18 @@ def _petit_trace() -> bool:
 kPetitTrace = _petit_trace()
 
 
+def _drop_admit() -> bool:
+    """C6: ``TOKENSPEED_PETIT_DROP_ADMIT=1`` (read once at import) skips
+    stage 1's AdmitLaunch hop (the owner's launch-ready store to every peer
+    and its poll). Every cross-rank write it preceded is already ordered by
+    the previous call's combine epoch handoff (see DirectPushTokenShuffle.Run).
+    Off (the default) launches exactly the old kernels."""
+    return os.environ.get("TOKENSPEED_PETIT_DROP_ADMIT", "0") == "1"
+
+
+kDropAdmit = _drop_admit()
+
+
 def EstimatedReceivedExperts(num_rows_global, top_k, num_experts, num_ranks):
     """Distinct experts one rank is expected to receive rows for in a call.
 
@@ -286,11 +298,13 @@ def _MegaMoESolutions():
 
 class MegaMoESolutionAdapter:
     def __init__(self, solution):
-        self.Config = (
-            MegaMoEConfigSelector(solution, kTrace=True)
-            if kPetitTrace
-            else MegaMoEConfigSelector(solution)
-        )
+        # Opt-in switches enter the selector (and its key) only when on.
+        switches = {
+            name: True
+            for name, on in (("kTrace", kPetitTrace), ("kDropAdmit", kDropAdmit))
+            if on
+        }
+        self.Config = MegaMoEConfigSelector(solution, **switches)
         self.Workspace = MegaMoEWorkspace(self.Config)
 
     @cache

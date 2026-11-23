@@ -1378,3 +1378,40 @@ def test_petit_trace_switch_off_keeps_keys_and_workspace(profile, world_size) ->
     last_control = on.DirectPushLaunchReadyOffset(0, world_size - 1) + 4
     assert last_control <= on.TracePingWordOffset(0, 0, 0)
     assert on.TracePingWordOffset(0, 1, 7) + 4 <= on.kXGpuBarrierRecordBytes
+
+
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+def test_drop_admit_switch_keys_and_dispatch(profile) -> None:
+    """C6 (TOKENSPEED_PETIT_DROP_ADMIT): off (the default) the dispatch keeps
+    AdmitLaunch and the selector key; on, the key gains ``drop-admit`` (a
+    separate compile variant) and the dispatch skips AdmitLaunch. The
+    workspace layout is the same either way (LaunchReady words stay)."""
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+    from lib.moe.rocm.mega_moe.mega_moe_two_stage_kernel import (
+        MegaMoETwoStageCommComputeKernel,
+    )
+    from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
+    from lib.moe.rocm.mega_moe_config_selector import MegaMoEConfigSelector
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, profile, 4, 1024)
+    adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
+    solution = adapter.Config.kSolution
+    off_config = MegaMoEConfigSelector(solution)  # explicit: any switch set
+    off = MegaMoETwoStageCommComputeKernel(off_config, True)
+    assert off.TokenDispatch.kAdmitLaunch is True
+    assert "kAdmitLaunch" not in vars(off.TokenDispatch)
+    assert MegaMoETwoStageCommComputeKernel(
+        adapter.Config, True
+    ).TokenDispatch.kAdmitLaunch is (not module.kDropAdmit)
+    on_config = MegaMoEConfigSelector(solution, kDropAdmit=True)
+    assert on_config._key == (solution.Repr(), "drop-admit")
+    on = MegaMoETwoStageCommComputeKernel(on_config, True)
+    assert on.TokenDispatch.kAdmitLaunch is False
+    assert on.cache_key != off.cache_key
+    assert MegaMoEWorkspace(on_config).cache_key == MegaMoEWorkspace(off_config).cache_key
+    both = MegaMoEConfigSelector(solution, kTrace=True, kDropAdmit=True)
+    assert both._key == ((solution.Repr(), "trace"), "drop-admit")
