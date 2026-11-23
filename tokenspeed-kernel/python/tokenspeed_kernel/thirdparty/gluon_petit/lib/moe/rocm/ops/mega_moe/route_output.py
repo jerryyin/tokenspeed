@@ -24,9 +24,17 @@ class Context(NamedTuple):
 
 
 class MegaMoETwoStage2Epilogue(TwoStageStage2Epilogue):
+    # Route stores: non-temporal (default); C7 sets write-through per instance.
+    kRouteStoreAux = BufferResource.kNTBit
+
     def __init__(self, TileSchedule):
         super().__init__(TileSchedule)
         self.Workspace = MegaMoEWorkspace(self.Config)
+        if getattr(self.Config, "kCombineNoBarrier", False):
+            # C7: write-through system stores, so a tile's routes are at the
+            # source rank once its VMEM counter drains (no L2 write-back by
+            # the combine's grid barrier needed).
+            self.kRouteStoreAux = BufferResource.kSC0Bit | BufferResource.kSC1Bit
         self.kPayloadLoadAux = (
             BufferResource.kSC1Bit
             if self.Config.kNumRanks > 1
@@ -83,7 +91,11 @@ class MegaMoETwoStage2Epilogue(TwoStageStage2Epilogue):
                 value = lds_load(output + row * (self.kTileCols // 2) + pair_col)
                 col = tile_col + pair_col * 2
                 BufferResource.StoreU32(
-                    output_row, col * 2, 0, value, BufferResource.kNTBit
+                    output_row,
+                    col * 2,
+                    0,
+                    value,
+                    self.kRouteStoreAux,
                 )
 
 

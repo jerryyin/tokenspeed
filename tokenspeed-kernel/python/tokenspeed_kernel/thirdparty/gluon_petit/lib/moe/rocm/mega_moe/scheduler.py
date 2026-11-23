@@ -247,6 +247,21 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
         return found, work
 
     @device_method
+    def Stage2TileCount(self, state):
+        """Stage 2's tiles this call (C7's publish target)."""
+        last_metadata = group_gather(
+            state.expert_metadata_[(self.kNumExpertsPerRank - 1) // 64],
+            (self.kNumExpertsPerRank - 1) % 64,
+            64,
+        )
+        last_metadata = first(last_metadata)
+        last_tokens = last_metadata & self.kTokenCountMask
+        total_blocks = (last_metadata >> self.kTokenCountBits) + (
+            last_tokens + self.kSortedTokenBlock - 1
+        ) // self.kSortedTokenBlock
+        return total_blocks * self.kLinear2Tiles
+
+    @device_method
     def GetStage2Work(self, state, wtid, stage2_id):
         last_metadata = group_gather(
             state.expert_metadata_[(self.kNumExpertsPerRank - 1) // 64],

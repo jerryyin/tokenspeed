@@ -32,6 +32,7 @@ from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.tensor_ops import (
     atomic_add,
     atomic_or,
+    first,
     is_first_thread,
     prevent_loop_unroll,
     store_words,
@@ -90,6 +91,8 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
         self.kStage1TileCount = self.kInterDim // Config.kStage1GroupN
         self.kStage2GridBlocks, self.kWorkShards = self.kNumSMs * 5, 8
         self.kOverlapStage1WorkId = getattr(Config, "kOverlapStage1WorkId", False)
+        # C7 (TOKENSPEED_PETIT_COMBINE_NOBARRIER): stage 2 publishes the epoch.
+        self.kCombineNoBarrier = getattr(Config, "kCombineNoBarrier", False)
         self.kComputeWords = max(
             self.Stage1Op.kShmWords,
             self.ActivationQuantizer.kQuantizeShmWords,
@@ -445,7 +448,76 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
                     wid,
                     wtid,
                 )
+                if self.kCombineNoBarrier:
+                    self.Stage2TileDone(workspace, scheduler, tid)
                 stage2_id += self.kStage2GridBlocks
+        if self.kCombineNoBarrier:
+            # No stage-2 tiles (a call routing nothing here): CTA 0 publishes.
+            if sm_id == 0:
+                if self.Scheduler.Stage2TileCount(scheduler) == 0:
+                    if wave_id() == 0:
+                        self.PublishEpoch(workspace)
+
+    @device_method
+    def PublishEpoch(self, workspace):
+        """C7: wave 0 stores the call's epoch to every peer's epoch signal
+        (what the combine's CTA 0 did after its grid barrier)."""
+        lane = l.arange(
+            0, 64, layout=l.BlockedLayout([1], [64], [l.num_warps()], [0])
+        ).to(l.uint32)
+        epoch = BufferResource.LoadU32(
+            workspace.br_,
+            self.Workspace.DirectPushEpochGateOffset(workspace.rank_id_),
+            0,
+            BufferResource.kSC0Bit | BufferResource.kSC1Bit,
+        )
+        system_fence_acquire()
+        system_fence_release()
+        store_words(
+            workspace.br_,
+            self.Workspace.XGpuEpochSignalOffset(lane, workspace.rank_id_),
+            0,
+            epoch,
+            1,
+            BufferResource.kSC0Bit | BufferResource.kSC1Bit,
+            lane < self.Config.kNumRanks,
+        )
+        amdgcn_s_waitcnt(0, -1, 0)
+
+    @device_method
+    def Stage2TileDone(self, workspace, scheduler, tid):
+        """C7: after a tile's write-through route stores drain (every wave),
+        count the tile; the tile that completes the call publishes the epoch
+        and resets the counter for the next call (ordered by stream order)."""
+        complete_scoped_vmem()
+        l.barrier()
+        if wave_id() == 0:
+            lane = l.arange(
+                0, 64, layout=l.BlockedLayout([1], [64], [l.num_warps()], [0])
+            ).to(l.uint32)
+            system_fence_release()
+            done = first(
+                atomic_add(
+                    workspace.br_,
+                    self.Workspace.Stage2DoneCounterOffset() + lane * 0,
+                    0,
+                    1,
+                    BufferResource.kAtomicScopeAgent,
+                    lane == 0,
+                )
+            ).to(l.uint32) + 1
+            if done == self.Scheduler.Stage2TileCount(scheduler):
+                store_words(
+                    workspace.br_,
+                    self.Workspace.Stage2DoneCounterOffset() + lane * 0,
+                    0,
+                    l.full((), 0, l.uint32),
+                    1,
+                    BufferResource.kSC1Bit,
+                    lane == 0,
+                )
+                self.PublishEpoch(workspace)
+        l.barrier()
 
     @device_method
     def RunStage1Kernel(
@@ -565,6 +637,8 @@ class MegaMoECombineKernel(DeviceTemplate):
         )
         self.Config, self.Workspace = Config, MegaMoEWorkspace(Config)
         self.kAddResidual = kAddResidual
+        # C7: stage 2's last tile published the epoch; no grid barrier here.
+        self.kNoBarrier = getattr(Config, "kCombineNoBarrier", False)
         self.Reducer = SourceRouteReducer(
             Config, self.kNumSMs, self.kThreads, kReduceRoutes, kAddResidual
         )
@@ -601,35 +675,38 @@ class MegaMoECombineKernel(DeviceTemplate):
         if self.Workspace.kTrace:
             self.Workspace.TraceStore(workspace, dispatch_epoch, 2, 0, trace_entry, tid)
             self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 1, tid)
-        tensor_grid_sync(
-            self.Workspace,
-            workspace,
-            sm_id,
-            self.kNumSMs,
-            self.kOutputHandoffGridSyncIndex,
-            False,
-            True,
-        )
+        if not self.kNoBarrier:
+            tensor_grid_sync(
+                self.Workspace,
+                workspace,
+                sm_id,
+                self.kNumSMs,
+                self.kOutputHandoffGridSyncIndex,
+                False,
+                True,
+            )
         if self.Workspace.kTrace:
             self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 2, tid)
         if wave_id() == 0:
-            if sm_id == 0:
-                system_fence_acquire()
-                system_fence_release()
-                store_words(
-                    workspace.br_,
-                    self.Workspace.XGpuEpochSignalOffset(tid, workspace.rank_id_),
-                    0,
-                    dispatch_epoch,
-                    1,
-                    BufferResource.kSC0Bit | BufferResource.kSC1Bit,
-                    tid < self.Config.kNumRanks,
-                )
+            if not self.kNoBarrier:
+                if sm_id == 0:
+                    system_fence_acquire()
+                    system_fence_release()
+                    store_words(
+                        workspace.br_,
+                        self.Workspace.XGpuEpochSignalOffset(tid, workspace.rank_id_),
+                        0,
+                        dispatch_epoch,
+                        1,
+                        BufferResource.kSC0Bit | BufferResource.kSC1Bit,
+                        tid < self.Config.kNumRanks,
+                    )
             wave_barrier()
-            if sm_id == 0:
-                amdgcn_s_waitcnt(0, -1, 0)
-                if self.Workspace.kTrace:
-                    self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 3, tid)
+            if not self.kNoBarrier:
+                if sm_id == 0:
+                    amdgcn_s_waitcnt(0, -1, 0)
+                    if self.Workspace.kTrace:
+                        self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 3, tid)
             peer = l.arange(
                 0, 64, layout=l.BlockedLayout([1], [64], [l.num_warps()], [0])
             ).to(l.uint32)

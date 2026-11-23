@@ -1415,3 +1415,79 @@ def test_drop_admit_switch_keys_and_dispatch(profile) -> None:
     assert MegaMoEWorkspace(on_config).cache_key == MegaMoEWorkspace(off_config).cache_key
     both = MegaMoEConfigSelector(solution, kTrace=True, kDropAdmit=True)
     assert both._key == ((solution.Repr(), "trace"), "drop-admit")
+
+
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+def test_combine_no_barrier_switch_variants_and_grid(profile) -> None:
+    """C7 (TOKENSPEED_PETIT_COMBINE_NOBARRIER): off keeps the selector key,
+    non-temporal route stores, the combine's grid barrier and its 128-CTA
+    grid at every count. On, the key gains ``combine-nobarrier``; stage 2's
+    route stores are write-through (SC0|SC1) and stage 2 publishes the
+    epoch; the combine has no barrier and launches one CTA at 0 rows and
+    128 otherwise; the done counter is a spare word of the grid-sync line."""
+    import contextlib
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+    from lib.gemm.rocm.intrinsics import BufferResource
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, profile, 4, 1024)
+    solution_id = config._solution_id_for_tokens(1)
+    solution = module._MegaMoESolution(solution_id).Config.kSolution
+    # Both adapters built here (the process's other switches apply to both).
+    with mock.patch.object(module, "kCombineNoBarrier", False):
+        off = module.MegaMoESolutionAdapter(solution)
+    with mock.patch.object(module, "kCombineNoBarrier", True):
+        on = module.MegaMoESolutionAdapter(solution)
+    assert on.Config._key == (off.Config._key, "combine-nobarrier")
+    b1, b2, b_combine = off.Kernels(True, False, False, True)
+    s1, s2, combine = on.Kernels(True, False, False, True)
+    assert not b2.kCombineNoBarrier and s2.kCombineNoBarrier
+    assert not b_combine.kNoBarrier and combine.kNoBarrier
+    assert b2.Stage2Epilogue.kRouteStoreAux == BufferResource.kNTBit
+    assert s2.Stage2Epilogue.kRouteStoreAux == (
+        BufferResource.kSC0Bit | BufferResource.kSC1Bit
+    )
+    assert "kRouteStoreAux" not in vars(b2.Stage2Epilogue)
+    n2 = on.Kernels(True, False, False, True, stage2_n128=True)[1]
+    assert n2.Stage2Epilogue.kRouteStoreAux == s2.Stage2Epilogue.kRouteStoreAux
+    W = on.Workspace
+    counter = W.Stage2DoneCounterOffset()
+    grid_line = W.GridSyncBarrierOffset()
+    assert grid_line + W.kMaxGridSyncSlots * 4 + 4 <= counter < grid_line + W.kCacheLineBytes
+    assert W.cache_key == off.Workspace.cache_key  # same layout
+
+    class Recorder:
+        def __init__(self, name):
+            self.name, self.grids = name, []
+
+        def warmup(self, *args, grid, **kwargs):
+            self.grids.append(grid)
+
+    def combine_grids(adapter, num_tokens):
+        kernels = {k: Recorder(k) for k in ("MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine")}
+        params = module.MegaMoEParams(
+            out=None if num_tokens == 0 else object(),
+            output_row_stride=adapter.Config.kHiddenSize,
+            w13=object(), w2=object(), scales_w13=object(), scales_w2=object(),
+            input_tokens=object(), input_topk_ids=object(), input_topk_weights=object(),
+            num_tokens=num_tokens, hidden_size=adapter.Config.kComputeHiddenSize,
+            inter_dim=adapter.Config.kInterDim, w13_bias=None, w2_bias=None,
+            workspace=SimpleNamespace(device="cpu"), rank=0, reduce_routes=True,
+        )
+        with contextlib.ExitStack() as stack:
+            for name, rec in kernels.items():
+                stack.enter_context(mock.patch.object(module, name, rec))
+            stack.enter_context(mock.patch("lib.streams.native_stream", lambda s, d: None))
+            stack.enter_context(
+                mock.patch("torch.cuda.stream", lambda s: contextlib.nullcontext())
+            )
+            assert adapter.Invoke(params, compile_only=True) == 0
+        return kernels["MegaMoECombine"].grids, kernels["MegaMoEStage2"].grids
+
+    assert combine_grids(off, 0) == ([(128,)], [(1280,)])
+    assert combine_grids(off, 6) == ([(128,)], [(1280,)])
+    assert combine_grids(on, 0) == ([(1,)], [(1280,)])
+    assert combine_grids(on, 6) == ([(128,)], [(1280,)])
