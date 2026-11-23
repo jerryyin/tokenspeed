@@ -15,11 +15,12 @@ from lib.moe.rocm.comm.barrier import (
     system_fence_release,
     tensor_grid_sync,
     wait_tensor_signal,
+    wait_xgpu_signal_relaxed,
     wave_barrier,
 )
 from lib.moe.rocm.fused_moe import ClearMat
 from lib.moe.rocm.mega_moe.scheduler import MegaMoETwoStageScheduler, Work
-from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
+from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace, TraceNow
 from lib.moe.rocm.ops.mega_moe.route_output import (
     Context,
     MegaMoETwoStage2Epilogue,
@@ -182,7 +183,11 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
         wid,
         wtid,
     ):
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 8, tid)
         self.WaitForPayloadBlocks(workspace, work, tid)
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 9, tid)
         pool_base = work.pool_row
         input_state = self.Input.Initialize(
             workspace.br_, workspace.rank_id_, pool_base, work.work_m, self.Workspace
@@ -207,6 +212,8 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
             shm, tiles, tid, wid, wtid, tokens, work.work_m
         )
         l.barrier()
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 10, tid)
         quant_shm = shm.to(l.pointer_type(l.float32))
         self.ActivationQuantizer.StoreAccumulator(quant_shm, hidden, wid, wtid)
         l.barrier()
@@ -248,6 +255,27 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
                 is_first_thread(tid),
             )
         l.barrier()
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 11, tid)
+            # Aux word: the last tile's expert (low half) and rows (high half).
+            self.Workspace.TraceStore(
+                workspace,
+                dispatch_epoch,
+                0,
+                13,
+                work.expert_idx.to(l.uint64) | (work.work_m.to(l.uint64) << 32),
+                tid,
+            )
+
+    @device_method
+    def TraceEpoch(self, workspace):
+        """The call's epoch (stage 1's local EpochGate), for trace slots."""
+        return BufferResource.LoadU32(
+            workspace.br_,
+            self.Workspace.DirectPushEpochGateOffset(workspace.rank_id_),
+            0,
+            BufferResource.kSC0Bit | BufferResource.kSC1Bit,
+        )
 
     @device_method
     def WaitL2Block(self, workspace, pool_block, tid):
@@ -289,6 +317,9 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
         )
         accum = ClearMat(tid, self.Stage2Tiles.kAccumFragments)
         self.WaitL2Block(workspace, work.pool_block, tid)
+        if self.Workspace.kTrace:
+            trace_epoch = self.TraceEpoch(workspace)
+            self.Workspace.TraceStamp(workspace, trace_epoch, 1, 2, tid)
         row, vector = (
             tid // self.Stage2Input.kVectorsPerRow,
             tid % self.Stage2Input.kVectorsPerRow,
@@ -321,10 +352,14 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
             input_regs = self.Stage2Input.ReadLds(shm, stage, prefetched.scale, wtid)
             accum = self.Stage2Tiles.Matmul(tiles, accum, input_regs, stage, wtid)
         l.barrier()
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, self.TraceEpoch(workspace), 1, 3, tid)
         accum = self.Stage2Epilogue.Apply(accum, bias, route_weights)
         self.Stage2Epilogue.WriteShm(shm, accum, wid, wtid)
         l.barrier()
         self.Stage2Epilogue.WriteBack(context, shm, tile_col, wid, wtid)
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, self.TraceEpoch(workspace), 1, 4, tid)
 
     @device_method
     def ComputeStage1Only(
@@ -436,15 +471,27 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
         """
         wid, wtid = tid // 64, tid % 64
         workspace = self.Workspace.Initialize(base, rank)
+        if self.Workspace.kTrace:
+            # Site 0 (entry) and site 14 (an immediate second stamp: the
+            # per-stamp cost), stored once the epoch is known.
+            trace_entry = TraceNow()
+            trace_again = TraceNow()
         dispatch = self.TokenDispatch.Construct(
             num_tokens, workspace, shm, input_tokens, input_topk_ids, input_topk_weights
         )
         dispatch, dispatch_epoch = self.TokenDispatch.Run(
             dispatch, sm_id, tid, wid, wtid
         )
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStore(workspace, dispatch_epoch, 0, 0, trace_entry, tid)
+            self.Workspace.TraceStore(workspace, dispatch_epoch, 0, 14, trace_again, tid)
         self.TokenDispatch.WaitForLocalPlan(dispatch, dispatch_epoch, tid)
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 6, tid)
         scheduler = self.Scheduler.Construct(workspace)
         scheduler = self.Scheduler.FetchRecvSumPerExpert(scheduler, wtid)
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 7, tid)
         self.ComputeStage1Only(
             workspace,
             scheduler,
@@ -459,6 +506,9 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
             wid,
             wtid,
         )
+        if self.Workspace.kTrace:
+            l.barrier()
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 0, 12, tid)
 
     @device_method
     def RunStage2Kernel(
@@ -481,8 +531,14 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
         """
         wid, wtid = tid // 64, tid % 64
         workspace = self.Workspace.Initialize(base, rank)
+        if self.Workspace.kTrace:
+            trace_entry = TraceNow()
+            trace_epoch = self.TraceEpoch(workspace)
+            self.Workspace.TraceStore(workspace, trace_epoch, 1, 0, trace_entry, tid)
         scheduler = self.Scheduler.Construct(workspace)
         scheduler = self.Scheduler.FetchRecvSumPerExpert(scheduler, wtid)
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, trace_epoch, 1, 1, tid)
         self.ComputeStage2Only(
             workspace,
             scheduler,
@@ -495,6 +551,9 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
             wid,
             wtid,
         )
+        if self.Workspace.kTrace:
+            l.barrier()
+            self.Workspace.TraceStamp(workspace, trace_epoch, 1, 5, tid)
 
 
 class MegaMoECombineKernel(DeviceTemplate):
@@ -531,12 +590,17 @@ class MegaMoECombineKernel(DeviceTemplate):
         """
         wid, wtid = tid // 64, tid % 64
         workspace = self.Workspace.Initialize(base, rank)
+        if self.Workspace.kTrace:
+            trace_entry = TraceNow()
         dispatch_epoch = BufferResource.LoadU32(
             workspace.br_,
             self.Workspace.DirectPushEpochGateOffset(workspace.rank_id_),
             0,
             BufferResource.kSC0Bit | BufferResource.kSC1Bit,
         )
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStore(workspace, dispatch_epoch, 2, 0, trace_entry, tid)
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 1, tid)
         tensor_grid_sync(
             self.Workspace,
             workspace,
@@ -546,6 +610,8 @@ class MegaMoECombineKernel(DeviceTemplate):
             False,
             True,
         )
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 2, tid)
         if wave_id() == 0:
             if sm_id == 0:
                 system_fence_acquire()
@@ -562,6 +628,8 @@ class MegaMoECombineKernel(DeviceTemplate):
             wave_barrier()
             if sm_id == 0:
                 amdgcn_s_waitcnt(0, -1, 0)
+                if self.Workspace.kTrace:
+                    self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 3, tid)
             peer = l.arange(
                 0, 64, layout=l.BlockedLayout([1], [64], [l.num_warps()], [0])
             ).to(l.uint32)
@@ -574,6 +642,8 @@ class MegaMoECombineKernel(DeviceTemplate):
             )
             wave_barrier()
         l.barrier()
+        if self.Workspace.kTrace:
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 4, tid)
         self.Reducer.Run(
             workspace,
             out,
@@ -585,6 +655,9 @@ class MegaMoECombineKernel(DeviceTemplate):
             residual,
             residual_row_stride,
         )
+        if self.Workspace.kTrace:
+            l.barrier()
+            self.Workspace.TraceStamp(workspace, dispatch_epoch, 2, 5, tid)
 
 
 @g.jit
@@ -802,3 +875,86 @@ def MegaMoECombineResidual(
         l.program_id(0).to(l.uint32),
         tid,
     )
+
+
+class MegaMoETracePingKernel(DeviceTemplate):
+    """Clock alignment for TOKENSPEED_PETIT_TRACE: rank 0 and each peer r
+    exchange kTracePingIters store/poll round trips with the protocol's
+    system-scope stores and SC0|SC1 polls (one wave, one CTA per rank)."""
+
+    def __init__(self, Config):
+        self._key = Config.cache_key
+        self.Config, self.Workspace = Config, MegaMoEWorkspace(Config)
+        self.kNumRanks = Config.kNumRanks
+        assert self.Workspace.kTrace
+
+    @device_method
+    def Run(self, base, rank, phase, seq_base, tid):
+        workspace = self.Workspace.Initialize(base, rank)
+        me = workspace.rank_id_
+        kSystem: l.constexpr = BufferResource.kSC0Bit | BufferResource.kSC1Bit
+        for peer in range(1, self.kNumRanks):
+            for it in range(self.Workspace.kTracePingIters):
+                seq = (seq_base + it + 1).to(l.uint32)
+                if me == 0:
+                    sent = TraceNow()
+                    store_words(
+                        workspace.br_,
+                        self.Workspace.TracePingWordOffset(peer, 0, peer) + tid * 0,
+                        0,
+                        seq,
+                        1,
+                        kSystem,
+                        tid == 0,
+                    )
+                    wait_xgpu_signal_relaxed(
+                        workspace,
+                        self.Workspace.TracePingWordOffset(0, 1, peer),
+                        seq.to(l.int32),
+                    )
+                    seen = TraceNow()
+                    self.StorePair(workspace, phase, peer, it, sent, seen, tid)
+                elif me == peer:
+                    wait_xgpu_signal_relaxed(
+                        workspace,
+                        self.Workspace.TracePingWordOffset(peer, 0, peer),
+                        seq.to(l.int32),
+                    )
+                    seen = TraceNow()
+                    store_words(
+                        workspace.br_,
+                        self.Workspace.TracePingWordOffset(0, 1, peer) + tid * 0,
+                        0,
+                        seq,
+                        1,
+                        kSystem,
+                        tid == 0,
+                    )
+                    sent = TraceNow()
+                    self.StorePair(workspace, phase, peer, it, seen, sent, tid)
+        amdgcn_s_waitcnt(0, -1, 0)
+
+    @device_method
+    def StorePair(self, workspace, phase, peer, it, first_stamp, second_stamp, tid):
+        first_stamp = first_stamp.to(l.uint64)
+        second_stamp = second_stamp.to(l.uint64)
+        offset = self.Workspace.TracePingStampOffset(phase, peer, it, 0) + tid * 0
+        words = (
+            first_stamp.to(l.uint32),
+            (first_stamp >> 32).to(l.uint32),
+            second_stamp.to(l.uint32),
+            (second_stamp >> 32).to(l.uint32),
+        )
+        for word in l.static_range(4):
+            store_words(
+                workspace.br_, offset + word * 4, 0, words[word], 1,
+                BufferResource.kNone, tid == 0,
+            )
+
+
+@g.jit
+def MegaMoETracePing(base, rank, phase, seq_base, Kernel: l.constexpr):
+    """TOKENSPEED_PETIT_TRACE clock alignment; one CTA of one wave per rank,
+    launched on every rank (MegaMoETracePingRun)."""
+    tid = l.arange(0, 64, layout=l.BlockedLayout([1], [64], [1], [0])).to(l.uint32)
+    Kernel.Run(base, rank, phase, seq_base, tid)

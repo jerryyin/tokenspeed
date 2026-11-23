@@ -1310,3 +1310,71 @@ def test_fuse_post_combine_variant_and_apply_plumbing() -> None:
         assert kwargs["residual"] is residual and kwargs["residual_ready"] is ready
         assert got is target and kwargs["out"] is target
         assert not petit._PETIT_COMBINE_POST  # the scope is popped
+
+
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_petit_trace_switch_off_keeps_keys_and_workspace(profile, world_size) -> None:
+    """TOKENSPEED_PETIT_TRACE: off (the default) leaves the selector's _key,
+    the workspace fields and the heap bytes those without the trace; on
+    appends ``trace`` to the key and a local region of 8 slots x 3 kernels x
+    256 rows x 16 sites of u64 stamps plus the ping block after the local
+    data, with the ping words in the barrier record's spare tail. The off
+    objects are built explicitly, so the test holds in any switch set."""
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+    from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
+    from lib.moe.rocm.mega_moe_config_selector import MegaMoEConfigSelector
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, profile, world_size, 1024)
+    adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
+    solution = adapter.Config.kSolution
+    off_config = MegaMoEConfigSelector(solution)
+    assert off_config._key == solution.Repr() and "kTrace" not in vars(off_config)
+    off = MegaMoEWorkspace(off_config)
+    assert not any(k.startswith("kTrace") for k in vars(off))
+    assert off.kLocalBytes == off.kLocalDataBytes64
+
+    def page(n):
+        return (n + 4095) // 4096 * 4096
+
+    heap = _DEFAULT_CAPACITY_HEAP_BYTES[(profile.name, world_size)]
+    grow = page(adapter.Workspace.kLocalBytes) - page(off.kLocalBytes)
+    assert config.heap_bytes() == (heap[0] + grow, heap[1] + grow)
+    info = adapter.GetWorkspaceInfo(0)
+    if not module.kPetitTrace:  # this process's adapter is the switch-off one
+        assert grow == 0  # other switches may still extend the key
+        assert (info.trace_offset, info.trace_bytes) == (0, 0)
+        assert module.MegaMoETracePingRun(
+            config._solution_id_for_tokens(1), None, 0, 0, 0
+        ) == module.kFusedMoEErrorInvalidArgument
+    else:
+        assert grow > 0 and (info.trace_offset, info.trace_bytes) == (
+            adapter.Workspace.TraceOffset(0, 0, 0, 0), adapter.Workspace.kTraceBytes
+        )
+
+    on_config = MegaMoEConfigSelector(solution, kTrace=True)
+    assert on_config._key == (solution.Repr(), "trace")
+    on = MegaMoEWorkspace(on_config)
+    assert on.kTrace and on.cache_key != off.cache_key
+    ring = 8 * 3 * 256 * 16 * 8
+    assert on.kTraceRingBytes == ring and on.kTraceBytes == ring + 2 * 8 * 64 * 2 * 8
+    assert on.kTraceLocalOffset >= off.kLocalDataBytes64
+    assert on.kLocalBytes == on.kTraceLocalOffset + on.kTraceBytes
+    assert on.kWorkspaceBytes64 < (1 << 32)
+    base = on.TraceOffset(0, 0, 0, 0)
+    assert base == on.kLocalOffsetBase + on.kTraceLocalOffset
+    assert on.TraceOffset(7, 2, 255, 15) + 8 == base + ring
+    assert on.TraceOffset(1, 0, 0, 0) - base == 3 * 256 * 16 * 8
+    assert on.TracePingStampOffset(1, 7, 63, 1) + 8 == base + on.kTraceBytes
+    # Every other offset is the switch-off one (the region is appended).
+    for name in ("InputTokensOffset", "L2ScaleBufferOffset", "DirectPushLaunchReadyOffset"):
+        args = (0, 0) if name == "DirectPushLaunchReadyOffset" else ()
+        assert getattr(on, name)(*args) == getattr(off, name)(*args)
+    # Ping words: after the direct-push control block, inside the record.
+    last_control = on.DirectPushLaunchReadyOffset(0, world_size - 1) + 4
+    assert last_control <= on.TracePingWordOffset(0, 0, 0)
+    assert on.TracePingWordOffset(0, 1, 7) + 4 <= on.kXGpuBarrierRecordBytes

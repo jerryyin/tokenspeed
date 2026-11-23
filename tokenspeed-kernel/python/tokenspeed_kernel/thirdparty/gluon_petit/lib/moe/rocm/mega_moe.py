@@ -20,6 +20,8 @@ from lib.moe.rocm.mega_moe.mega_moe_two_stage_kernel import (
     MegaMoECombineResidual,
     MegaMoEStage1,
     MegaMoEStage2,
+    MegaMoETracePing,
+    MegaMoETracePingKernel,
     MegaMoETwoStageCommComputeKernel,
 )
 from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
@@ -83,6 +85,19 @@ def _stage2_n128() -> bool:
 
 
 kStage2N128 = _stage2_n128()
+
+
+def _petit_trace() -> bool:
+    """Per-hop instrumentation: ``TOKENSPEED_PETIT_TRACE=1`` (read once at
+    import) stamps ``s_memrealtime`` at fixed sites of stage 1, stage 2 and
+    the combine into an 8-call ring in each rank's local workspace (see
+    ``MegaMoEWorkspace.TraceOffset``; ``MegaMoEWorkspaceInfo.trace_offset``
+    and ``trace_bytes`` locate it) and enables ``MegaMoETracePing``. Off (the
+    default) leaves keys, workspace bytes and kernels unchanged."""
+    return os.environ.get("TOKENSPEED_PETIT_TRACE", "0") == "1"
+
+
+kPetitTrace = _petit_trace()
 
 
 def EstimatedReceivedExperts(num_rows_global, top_k, num_experts, num_ranks):
@@ -196,6 +211,10 @@ class MegaMoEWorkspaceInfo:
     hidden_size: int
     compute_hidden_size: int
     act_dtype: object
+    # TOKENSPEED_PETIT_TRACE: byte offset and size of the trace region in the
+    # rank's heap (0, 0 when off); layout in MegaMoEWorkspace.TraceOffset.
+    trace_offset: int = 0
+    trace_bytes: int = 0
 
 
 @cache
@@ -267,7 +286,11 @@ def _MegaMoESolutions():
 
 class MegaMoESolutionAdapter:
     def __init__(self, solution):
-        self.Config = MegaMoEConfigSelector(solution)
+        self.Config = (
+            MegaMoEConfigSelector(solution, kTrace=True)
+            if kPetitTrace
+            else MegaMoEConfigSelector(solution)
+        )
         self.Workspace = MegaMoEWorkspace(self.Config)
 
     @cache
@@ -376,6 +399,11 @@ class MegaMoESolutionAdapter:
             C.kHiddenSize,
             C.kComputeHiddenSize,
             C.kActDType,
+            *(
+                (W.TraceOffset(0, 0, 0, 0), W.kTraceBytes)
+                if W.kTrace
+                else ()
+            ),
         )
 
     def Invoke(self, params, compile_only=False):
@@ -550,6 +578,31 @@ def GetMegaMoEWorkspaceInfo(rank, solution_id):
     if adapter is None:
         raise ValueError("unsupported MegaMoE solution_id")
     return adapter.GetWorkspaceInfo(rank)
+
+
+def MegaMoETracePingRun(solution_id, workspace, rank, phase, seq_base, stream=None):
+    """Clock alignment for TOKENSPEED_PETIT_TRACE (a collective: launch on
+    every rank). Rank 0 and each peer r exchange ``kTracePingIters`` store /
+    poll round trips with the protocol's system-scope stores and polls; rank 0
+    stamps each send and each reply seen, rank r each ping seen and each
+    reply sent, into the trace region's ping block ``phase`` (0 before, 1
+    after a traced replay). ``seq_base`` must grow by at least
+    ``kTracePingIters`` per call on the same workspace (the words are never
+    reset). Returns 0, or an error when the switch is off."""
+    adapter = _MegaMoESolution(int(solution_id))
+    if adapter is None:
+        return kFusedMoEErrorInvalidSolution
+    if not adapter.Workspace.kTrace or phase not in (0, 1):
+        return kFusedMoEErrorInvalidArgument
+    import torch
+    from lib.streams import native_stream
+
+    kernel = MegaMoETracePingKernel(adapter.Config)
+    with torch.cuda.stream(native_stream(stream, workspace.device)):
+        MegaMoETracePing[(1,)](
+            workspace, rank, phase, seq_base, kernel, num_warps=1
+        )
+    return 0
 
 
 def MegaMoEStage1Tile(solution_id, num_tokens):

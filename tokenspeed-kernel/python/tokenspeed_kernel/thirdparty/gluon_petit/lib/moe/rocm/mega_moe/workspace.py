@@ -5,10 +5,12 @@ from pathlib import Path
 from typing import NamedTuple
 
 import lib.tal.host_device as _host_device_module
+from lib.gemm.rocm.intrinsics import BufferResource, _native_call
 from lib.moe.rocm.memory_ops import MakeBufferResource
 from lib.moe.rocm.ops.mxfp4_activation import MxFp4ActivationLayout
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.host_device import host_device
+from lib.tal.tensor_ops import store_words
 from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
 
@@ -23,8 +25,21 @@ def AlignUp(value, alignment):
     return ((value + alignment - 1) // alignment) * alignment
 
 
+@g.jit
+def TraceNow():
+    """The 100 MHz constant clock (``s_memrealtime``) as a uint64."""
+    return _native_call("llvm.amdgcn.s.memrealtime", "i64", (), (), False)
+
+
 class MegaMoEWorkspace(DeviceTemplate):
     __triton_builtin__ = True
+    # TOKENSPEED_PETIT_TRACE: off unless the layout carries kTrace, so the
+    # switch-off instance fields (and cache_key) are those without the trace.
+    kTrace = False
+    # 8 slots (the last 8 calls) keep the region at 784 KiB + 16 KiB, which
+    # fits below 32-bit offsets even at EP4's largest capacity (7,808 rows).
+    kTraceSlots, kTraceKernels, kTraceRows, kTraceSites = 8, 3, 256, 16
+    kTracePingIters, kTracePingPhases = 64, 2
 
     def __init__(self, Layout):
         self.Layout = Layout
@@ -117,6 +132,24 @@ class MegaMoEWorkspace(DeviceTemplate):
             + self.kL2ScaleBufferBytes
         )
         self.kLocalBytes64 = self.kLocalDataBytes64
+        if getattr(Layout, "kTrace", False):
+            # Per-hop stamps (TOKENSPEED_PETIT_TRACE=1): a local region after
+            # the local data, ``[slot = epoch mod kTraceSlots][kernel][row]
+            # [site]`` u64 stamps (a slot keeps the last call that wrote it), then
+            # the ping stamps ``[phase][peer][iter][2]``; ping words live at
+            # the end of each rank's barrier record.
+            self.kTrace = True
+            self.kTraceLocalOffset = AlignUp(self.kLocalDataBytes64, 4096)
+            self.kTraceRingBytes = (
+                self.kTraceSlots * self.kTraceKernels * self.kTraceRows
+                * self.kTraceSites * 8
+            )
+            self.kTracePingBytes = (
+                self.kTracePingPhases * 8 * self.kTracePingIters * 2 * 8
+            )
+            self.kTraceBytes = self.kTraceRingBytes + self.kTracePingBytes
+            self.kTracePingWordOffset = self.kXGpuBarrierRecordBytes - 2 * 8 * 4
+            self.kLocalBytes64 = self.kTraceLocalOffset + self.kTraceBytes
         self.kLocalBytes = self.kLocalBytes64
         self.kWorkspaceBytes64 = self.kLocalOffsetBase + self.kLocalBytes64
         self.kWorkspaceBytes = self.kWorkspaceBytes64
@@ -125,6 +158,11 @@ class MegaMoEWorkspace(DeviceTemplate):
             self.kDirectControlOffset + self.kDirectControlBytes
             <= self.kXGpuBarrierRecordBytes
         )
+        if self.kTrace:
+            assert (
+                self.kDirectControlOffset + self.kDirectControlBytes
+                <= self.kTracePingWordOffset
+            )
         assert self.kRankSlotRawBytes <= 0xFFFFFFFF
         assert self.kNumExperts % self.kNumRanks == 0 and self.kNumRanks < 256
         assert self.kLocalBytes64 <= (1 << 32)
@@ -389,3 +427,59 @@ class MegaMoEWorkspace(DeviceTemplate):
     @host_device
     def RankOffsetBase(self, rank):
         return self.kRankSymBufferBase + rank * self.kSlotStride
+
+    @host_device
+    def TraceOffset(self, slot, kernel, row, site):
+        """Byte offset of one u64 stamp (TOKENSPEED_PETIT_TRACE only)."""
+        return (
+            self.kLocalOffsetBase
+            + self.kTraceLocalOffset
+            + (
+                ((slot * self.kTraceKernels + kernel) * self.kTraceRows + row)
+                * self.kTraceSites
+                + site
+            )
+            * 8
+        )
+
+    @host_device
+    def TracePingStampOffset(self, phase, peer, it, which):
+        return (
+            self.kLocalOffsetBase
+            + self.kTraceLocalOffset
+            + self.kTraceRingBytes
+            + (((phase * 8 + peer) * self.kTracePingIters + it) * 2 + which) * 8
+        )
+
+    @host_device
+    def TracePingWordOffset(self, rank, kind, peer):
+        """Ping word ``kind`` (0: rank 0 -> peer, 1: peer -> rank 0) in
+        ``rank``'s barrier record."""
+        return (
+            rank * self.kXGpuBarrierRecordBytes
+            + self.kTracePingWordOffset
+            + (kind * 8 + peer) * 4
+        )
+
+    @device_method
+    def TraceStore(self, workspace, epoch, kernel: l.constexpr, site, stamp, tid):
+        """Thread 0 stores ``stamp`` at (epoch mod kTraceSlots, kernel, CTA, site);
+        CTAs at or above kTraceRows are not recorded."""
+        row = l.program_id(0).to(l.uint32)
+        offset = self.TraceOffset(
+            epoch & (self.kTraceSlots - 1), kernel, l.minimum(row, self.kTraceRows - 1), site
+        )
+        keep = (tid == 0) & (row < self.kTraceRows)
+        stamp = stamp.to(l.uint64)
+        store_words(
+            workspace.br_, offset + tid * 0, 0, stamp.to(l.uint32), 1,
+            BufferResource.kNone, keep,
+        )
+        store_words(
+            workspace.br_, offset + 4 + tid * 0, 0, (stamp >> 32).to(l.uint32), 1,
+            BufferResource.kNone, keep,
+        )
+
+    @device_method
+    def TraceStamp(self, workspace, epoch, kernel: l.constexpr, site, tid):
+        self.TraceStore(workspace, epoch, kernel, site, TraceNow(), tid)
