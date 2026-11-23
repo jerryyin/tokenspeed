@@ -83,13 +83,17 @@ from lib.tal.device import DeviceTemplate
 
 
 class MegaMoEConfigSelector(DeviceTemplate):
-    def __init__(self, Solution, kTrace=False):
+    def __init__(self, Solution, kTrace=False, kDropAdmit=False):
         self._key = Solution.Repr()
         if kTrace:
             # TOKENSPEED_PETIT_TRACE: in the key (and the instance) only when
             # on, so switch-off keys and kernels are unchanged.
             self._key = (self._key, "trace")
             self.kTrace = True
+        if kDropAdmit:
+            # C6 (TOKENSPEED_PETIT_DROP_ADMIT): the same rule.
+            self._key = (self._key, "drop-admit")
+            self.kDropAdmit = True
         self.kSolution = Solution
         self.kGroupM, self.kStage1GroupN = 32, 256
         self.kGroupN = 128 if Solution.W2TileShape() == MegaMoETileShape.kN128 else 256

@@ -53,8 +53,13 @@ class DirectPushState(NamedTuple):
 
 
 class DirectPushTokenShuffle(DeviceTemplate):
+    # C6 (TOKENSPEED_PETIT_DROP_ADMIT): an instance field only when on.
+    kAdmitLaunch = True
+
     def __init__(self, Config, kExternalInputs):
         self._key = (Config.cache_key, kExternalInputs)
+        if getattr(Config, "kDropAdmit", False):
+            self.kAdmitLaunch = False
         self.Workspace, self.Common = MegaMoEWorkspace(Config), TokenShuffleCommon(
             Config
         )
@@ -153,7 +158,16 @@ class DirectPushTokenShuffle(DeviceTemplate):
             self.Workspace.TraceStamp(state.workspace_, epoch, 0, 1, tid)
         owner = block == 0
         if owner:
-            self.AdmitLaunch(state, tid, epoch)
+            # C6 drops this hop: when any rank starts stage 1 of call e,
+            # every peer has finished stage 1 and stage 2 of call e-1 (its
+            # combine e-1 waited for every peer's epoch e-1, published after
+            # that peer's stage 2 e-1); the parity counters and flags written
+            # below are compared for equality with Expected(epoch), unique
+            # per parity use; payload rows wait for the destination's
+            # PlanReady(e). The heap is zeroed and followed by a host barrier
+            # before the first call.
+            if self.kAdmitLaunch:
+                self.AdmitLaunch(state, tid, epoch)
             if self.Workspace.kTrace:
                 self.Workspace.TraceStamp(state.workspace_, epoch, 0, 2, tid)
             self.PopulateSendCounters(state, tid, parity, expected)
