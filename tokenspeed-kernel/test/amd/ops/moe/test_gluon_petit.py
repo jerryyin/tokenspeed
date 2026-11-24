@@ -34,6 +34,8 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _MUSE_SPARK_PROFILE,
     _get_workspace,
     _GluonPetitState,
+    _import_petit_kernel,
+    _megamoe_config,
     _Profile,
     _validate_layer,
     gluon_petit_mxfp4_megamoe_apply,
@@ -58,6 +60,7 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
             routing_mode="precomputed_topk",
             a2a_backend="gluon_petit",
             ep_size=8,
+            persistent_max_num_tokens_per_gpu=1024,
             ispp=profile.logical_intermediate,
             hidden=profile.model_dim,
             swiglu_form="generalized" if profile.has_bias else None,
@@ -80,9 +83,12 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
 
 
 def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
-    with mock.patch(
-        "tokenspeed_kernel.selection.current_platform", return_value=mi350_platform
-    ), pytest.raises(NoKernelFoundError):
+    with (
+        mock.patch(
+            "tokenspeed_kernel.selection.current_platform", return_value=mi350_platform
+        ),
+        pytest.raises(NoKernelFoundError),
+    ):
         moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
@@ -118,6 +124,7 @@ def test_petit_plan_ep_sizes(ep_size, selected, mi350_platform) -> None:
                 routing_mode="precomputed_topk",
                 a2a_backend="gluon_petit",
                 ep_size=ep_size,
+                persistent_max_num_tokens_per_gpu=1024,
                 ispp=profile.logical_intermediate,
                 hidden=profile.model_dim,
                 swiglu_form="standard",
@@ -303,7 +310,51 @@ def test_workspace_rejects_world_size_outside_the_profile(
         ),
         pytest.raises(RuntimeError, match=error),
     ):
-        _get_workspace(torch.device("cuda", 0), profile)
+        _get_workspace(torch.device("cuda", 0), profile, 1024)
+
+
+@pytest.mark.parametrize(
+    "profile,world_size,tokens",
+    [
+        (_DSV41_FLASH_PROFILE, 4, 4096),
+        # EP8 sizes its workspace from the server too.
+        (_DSV41_FLASH_PROFILE, 8, 2048),
+        (_DSV41_FLASH_DSPARK_PROFILE, 4, 8192),
+    ],
+)
+def test_megamoe_config_sizes_the_workspace_for_its_capacity(
+    profile, world_size, tokens
+) -> None:
+    config = _megamoe_config(profile, world_size, tokens)
+    info = _import_petit_kernel().ops.mega_moe_workspace_info(0, config._solution_id)
+    assert config.max_tokens_per_rank == info.max_tokens_per_rank == tokens
+
+
+def test_megamoe_config_rejects_a_partial_token_block() -> None:
+    with pytest.raises(ValueError, match="positive multiple of 32"):
+        _megamoe_config(_DSV41_FLASH_PROFILE, 4, 1000)
+
+
+def test_workspace_names_the_largest_capacity_that_fits() -> None:
+    # The DSv4.1 Flash heap at EP4 passes 32-bit offsets above 7808 rows.
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.is_initialized", return_value=True
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.get_world_size", return_value=4
+        ),
+        pytest.raises(
+            ValueError,
+            match="fits at most 7808 tokens per rank for dsv41_flash at EP4; got 8192",
+        ),
+    ):
+        _get_workspace(torch.device("cuda", 0), _DSV41_FLASH_PROFILE, 8192)
+
+
+def test_weight_preprocessor_requires_a_capacity() -> None:
+    with pytest.raises(ValueError, match="persistent_max_num_tokens_per_gpu"):
+        gluon_petit_mxfp4_megamoe_weights(plan={}, w=torch.nn.Module())
 
 
 @pytest.mark.parametrize(
@@ -376,6 +427,7 @@ def test_weight_preprocessor_repacks_and_releases_source_parameters() -> None:
 
     native_layout = object()
     petit_kernel = SimpleNamespace(
+        MEGA_MOE_SORTED_TOKEN_BLOCK=32,
         MoeKernelLayout=SimpleNamespace(native_mxfp4=native_layout),
         repack_moe_kernel_layout=repack,
     )
@@ -384,17 +436,22 @@ def test_weight_preprocessor_repacks_and_releases_source_parameters() -> None:
             "tokenspeed_kernel.ops.moe.gluon._validate_layer",
             return_value=profile,
         ),
-        mock.patch("tokenspeed_kernel.ops.moe.gluon._get_workspace"),
+        mock.patch("tokenspeed_kernel.ops.moe.gluon._get_workspace") as workspace,
         mock.patch(
             "tokenspeed_kernel.ops.moe.gluon._import_petit_kernel",
             return_value=petit_kernel,
         ),
         mock.patch("tokenspeed_kernel.ops.moe.gluon.torch.cuda.empty_cache"),
     ):
-        gluon_petit_mxfp4_megamoe_weights(plan={}, w=module)
+        gluon_petit_mxfp4_megamoe_weights(
+            plan={"persistent_max_num_tokens_per_gpu": 1000}, w=module
+        )
 
     state = module._moe_backend_state
     assert state.profile == profile
+    # The capacity rounds up to Petit's 32-row sorted-token block.
+    assert state.max_tokens_per_rank == 1024
+    assert workspace.call_args.args[1:] == (profile, 1024)
     assert state.w13_weight.shape == (2, 64, 256)
     assert state.w13_scale.shape == (2, 64, 16)
     assert state.w2_weight.shape == (2, 512, 16)
@@ -438,6 +495,7 @@ def test_apply_keeps_zero_token_rank_in_collective() -> None:
             w2_scale=torch.empty(0),
             w13_bias=None,
             w2_bias=None,
+            max_tokens_per_rank=4,
         )
     )
     overlap = mock.Mock()

@@ -990,6 +990,11 @@ class ServerArgs:
     _beam_grammar_none_warned: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
+    # Whether the launch left --chunked-prefill-size unset: ModelConfig fits
+    # an unset chunk to Gluon Petit's capacity once the checkpoint is known.
+    _chunked_prefill_size_unset: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
     _speculative_widths_explicit: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
@@ -1402,6 +1407,7 @@ class ServerArgs:
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
+            self._chunked_prefill_size_unset = True
             self.chunked_prefill_size = 8192
 
         # Set CUDA graph max capture size.
@@ -3067,31 +3073,10 @@ class ServerArgs:
                 raise ValueError(
                     "Gluon Petit MegaMoE requires attention TP1 and dense TP1"
                 )
-            decode_tokens_per_request = (
-                self.speculative_num_draft_tokens
-                if self.speculative_algorithm is not None
-                else 1
-            )
-            decode_tokens_per_rank = (
-                self.max_num_seqs // self.mapping.attn.dp_size
-            ) * decode_tokens_per_request
-            if decode_tokens_per_rank > 1024:
+            if self.chunked_prefill_size <= 0:
                 raise ValueError(
-                    "Gluon Petit MegaMoE supports at most 1024 decode tokens "
-                    "per rank; reduce --max-num-seqs or the speculative draft "
-                    f"token count (configured {decode_tokens_per_rank} tokens "
-                    "per rank)"
-                )
-            if (
-                self.chunked_prefill_size <= 0
-                or self.chunked_prefill_size > 1024
-                or self.max_prefill_tokens > 1024
-            ):
-                raise ValueError(
-                    "Gluon Petit MegaMoE supports at most 1024 prefill tokens "
-                    "per rank; set --chunked-prefill-size to a positive value "
-                    "no greater than 1024 and --max-prefill-tokens no greater "
-                    "than 1024"
+                    "Gluon Petit MegaMoE sizes its workspace from "
+                    "--chunked-prefill-size; set it to a positive value"
                 )
 
     def validate_rank_emulation(self):

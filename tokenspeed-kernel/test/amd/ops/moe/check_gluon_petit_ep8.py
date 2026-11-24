@@ -80,6 +80,8 @@ def main() -> None:
         stages=petit.MegaMoeStages.two_stage,
         inter_dim=3072,
         has_bias=gpt,
+        # The largest checked call, rounded up to the 32-row sorted-token block.
+        max_tokens_per_rank=-(-max(args.tokens) // 32) * 32,
     )
     torch.manual_seed(20260926 + rank)
     w1, w2, s1, s2, b1, b2 = bench["build_petit_weights"](

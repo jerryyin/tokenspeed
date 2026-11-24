@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import cache
 
 from lib.moe.rocm.fused_moe import (
+    FusedMoESolutionId,
     IsGfx950,
     MegaMoEProducerGeometry,
     MegaMoETileShape,
@@ -86,7 +87,7 @@ def _MegaMoESolutions():
             solution = base.WithMegaMoEConfig(
                 ranks, experts, topk, hidden, inter, producer, MegaMoETileShape.kN256
             )
-            entries.append((solution.Repr(), MegaMoESolutionAdapter(solution)))
+            entries.append((solution.Repr(), solution))
 
     P = MegaMoEProducerGeometry
     register(
@@ -248,8 +249,23 @@ class MegaMoESolutionAdapter:
         return 0
 
 
+@cache
+def _MegaMoESolution(solution_id):
+    """Return the adapter for a registered solution at its encoded token capacity.
+
+    The registry holds solutions without a capacity. Returns None for an
+    unregistered solution or one that encodes no capacity; raises ValueError
+    when the capacity's workspace exceeds 32-bit offsets.
+    """
+    solution = FusedMoESolutionId.FromRepr(solution_id)
+    registered = solution.WithMaxTokensPerRank(0).Repr() in _MegaMoESolutions()
+    if not registered or solution.MaxTokensPerRank() == 0:
+        return None
+    return MegaMoESolutionAdapter(solution)
+
+
 def MegaMoECompute(params, solution_id):
-    adapter = _MegaMoESolutions().get(int(solution_id))
+    adapter = _MegaMoESolution(int(solution_id))
     if adapter is None:
         return kFusedMoEErrorInvalidSolution
     if not IsGfx950(params.stream, params.workspace.device):
@@ -258,7 +274,7 @@ def MegaMoECompute(params, solution_id):
 
 
 def GetMegaMoEWorkspaceInfo(rank, solution_id):
-    adapter = _MegaMoESolutions().get(int(solution_id))
+    adapter = _MegaMoESolution(int(solution_id))
     if adapter is None:
         raise ValueError("unsupported MegaMoE solution_id")
     return adapter.GetWorkspaceInfo(rank)

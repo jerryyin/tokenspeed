@@ -41,6 +41,10 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+from tokenspeed_kernel.ops.moe.gluon import (
+    _largest_max_tokens_per_rank,
+    _validate_layer,
+)
 from utils import is_cdna4
 
 
@@ -225,7 +229,9 @@ class _TestMoeLayer(torch.nn.Module):
             self.register_parameter("w2_weight_bias", None)
 
 
-def _make_plan(profile: _BenchmarkProfile, ep_size: int) -> dict:
+def _make_plan(
+    profile: _BenchmarkProfile, ep_size: int, max_tokens_per_rank: int = 1024
+) -> dict:
     return kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
@@ -252,6 +258,7 @@ def _make_plan(profile: _BenchmarkProfile, ep_size: int) -> dict:
         features=frozenset(),
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
+        persistent_max_num_tokens_per_gpu=max_tokens_per_rank,
         solution="gluon",
     )
 
@@ -387,8 +394,9 @@ _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
     _WORLD_SIZE not in (4, 8) or not is_cdna4(),
     reason="requires torchrun with four or eight gfx950 GPUs",
 )
+@pytest.mark.parametrize("capacity", ("1024", "largest"))
 @pytest.mark.parametrize("profile_name", tuple(_PROFILES))
-def test_distributed_petit_reference(profile_name):
+def test_distributed_petit_reference(profile_name, capacity):
     profile = _PROFILES[profile_name]
     if _WORLD_SIZE not in profile.world_sizes:
         sizes = "/".join(map(str, profile.world_sizes))
@@ -408,8 +416,14 @@ def test_distributed_petit_reference(profile_name):
     device = torch.device("cuda", local_rank)
     ws = _WORLD_SIZE
     layer = _TestMoeLayer(profile, ws, device)
+    # "largest" sizes the workspace at the edge of its 32-bit offsets.
+    max_tokens = (
+        1024
+        if capacity == "1024"
+        else _largest_max_tokens_per_rank(_validate_layer(layer), ws)
+    )
     _weights(layer, profile, rank, ws)
-    plan = _make_plan(profile, ws)
+    plan = _make_plan(profile, ws, max_tokens)
     kernel_moe_process_weights(plan, layer)
     output_dir = os.environ.get("PETIT_OUTPUT_DIR")
     # Exercise empty source ranks, padding/tile boundaries and capacity, then
@@ -418,15 +432,22 @@ def test_distributed_petit_reference(profile_name):
     # DSpark draft it switches at 12 and 24 tokens. EP4 keeps the empty and
     # single-token ranks and starts one rank at each switch, so one call still
     # mixes all three geometries, as the EP8 counts do.
-    for case, counts in (
-        ("balanced", [16] * ws),
-        ("uneven", {8: [0, 1, 15, 16, 31, 32, 63, 64], 4: [0, 1, 12, 24]}[ws]),
-        ("partial_scales", [256] * ws),
-        # For both DSv4.1 profiles, 640 tokens take the 4-warp 64-row stage-1 tile
-        # (Flash 480-1,007 tokens, DSpark 352-703).
-        ("stage1_m64_w4", [640] * ws),
-        ("capacity", [1024] + [1] * (ws - 1)),
-    ):
+    uneven = ("uneven", {8: [0, 1, 15, 16, 31, 32, 63, 64], 4: [0, 1, 12, 24]}[ws])
+    cases = (
+        (
+            ("balanced", [16] * ws),
+            uneven,
+            ("partial_scales", [256] * ws),
+            # For both DSv4.1 profiles, 640 tokens take the 4-warp 64-row
+            # stage-1 tile (Flash 480-1,007 tokens, DSpark 352-703).
+            ("stage1_m64_w4", [640] * ws),
+        )
+        if capacity == "1024"
+        # Every rank at capacity; refreshed steps route them all to one
+        # destination, filling its worst-case receive pool.
+        else (uneven, ("full", [max_tokens] * ws))
+    ) + (("capacity", [max_tokens] + [1] * (ws - 1)),)
+    for case, counts in cases:
         count = counts[rank]
         x = torch.empty((count, profile.hidden), device=device, dtype=torch.bfloat16)
         ids, weights = _routing(count, rank, profile, ws, device)
@@ -494,7 +515,12 @@ def test_distributed_petit_reference(profile_name):
                 directory.mkdir(parents=True, exist_ok=True)
                 torch.save(
                     actual.cpu(),
-                    directory / f"{profile_name}-{case}-{step}-rank{rank}.pt",
+                    directory
+                    / (
+                        f"{profile_name}-{case}-{step}-rank{rank}.pt"
+                        if capacity == "1024"
+                        else f"{profile_name}-largest-{case}-{step}-rank{rank}.pt"
+                    ),
                 )
             dist.barrier()
 

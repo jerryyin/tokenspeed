@@ -125,10 +125,18 @@ class MegaMoEWorkspace(DeviceTemplate):
             self.kDirectControlOffset + self.kDirectControlBytes
             <= self.kXGpuBarrierRecordBytes
         )
-        assert self.kRankSlotRawBytes <= 0xFFFFFFFF
         assert self.kNumExperts % self.kNumRanks == 0 and self.kNumRanks < 256
-        assert self.kLocalBytes64 <= (1 << 32)
-        assert self.kWorkspaceBytes64 < (1 << 32)
+        # One buffer resource addresses the whole heap, as VmmSymmetricHeap
+        # reserves it: every rank slot plus the page-aligned local region.
+        reservation = self.kLocalOffsetBase + AlignUp(
+            self.kLocalBytes64, self.kPageBytes
+        )
+        if reservation >= 1 << 32:
+            raise ValueError(
+                f"MegaMoE workspace for {self.kMaxTokensPerRank} tokens per rank "
+                f"at {self.kNumRanks} ranks and {self.kNumExperts} experts needs "
+                f"{reservation} bytes, exceeding 32-bit offsets"
+            )
 
     @property
     def cache_key(self):

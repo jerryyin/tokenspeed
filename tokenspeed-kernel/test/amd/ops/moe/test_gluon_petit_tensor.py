@@ -248,11 +248,12 @@ def test_partial_scale_load_preserves_lds(num_tokens):
         stages=petit_kernel.MegaMoeStages.two_stage,
         inter_dim=3072,
         has_bias=True,
+        max_tokens_per_rank=1024,
     )
     mega = importlib.import_module("lib.moe.rocm.mega_moe")
-    stage1, _, _ = mega._MegaMoESolutions()[
+    stage1, _, _ = mega._MegaMoESolution(
         config._solution_id_for_tokens(num_tokens)
-    ].Kernels(True, num_tokens >= 256, num_tokens >= 1024, True)
+    ).Kernels(True, num_tokens >= 256, num_tokens >= 1024, True)
     policy = stage1.Input
     source = torch.arange(
         policy.kGroupM * policy.kRowStride // 4, dtype=torch.int32, device="cuda"
@@ -341,8 +342,9 @@ def test_token_counts_do_not_recompile(reduce_routes: bool) -> None:
         stages=petit_kernel.MegaMoeStages.two_stage,
         inter_dim=3072,
         has_bias=True,
+        max_tokens_per_rank=1024,
     )
-    adapter = mega_moe._MegaMoESolutions()[config._solution_id_for_tokens(1)]
+    adapter = mega_moe._MegaMoESolution(config._solution_id_for_tokens(1))
     stage1, _, combine = adapter.Kernels(True, False, False, reduce_routes)
     device = torch.device("cuda", 0)
     uint8 = torch.empty(1, dtype=torch.uint8, device=device)

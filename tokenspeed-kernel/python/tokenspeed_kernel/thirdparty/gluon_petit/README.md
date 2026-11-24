@@ -30,8 +30,11 @@ when selecting a kernel plan.
 Select the backend with both `--moe-backend gluon_petit` and
 `--all2all-backend gluon_petit`. It requires one GFX950 node, EP8/TP1 (EP4/TP1
 is also accepted for the DeepSeek V4.1 Flash and DSpark geometries), BF16 model
-activations, serialized MXFP4 expert weights, trivial expert placement, and no
-more than 1024 tokens per rank. The registered profiles are GPT-OSS 120B, Kimi
+activations, serialized MXFP4 expert weights, and trivial expert placement.
+Its workspace is sized for the most tokens one rank sends per call (the
+`persistent_max_num_tokens_per_gpu` plan field), up to what keeps the symmetric
+heap below 32-bit offsets for the profile and EP size, such as 7808 tokens per
+rank for DeepSeek V4.1 Flash at EP4. The registered profiles are GPT-OSS 120B, Kimi
 K3, Muse Spark, the DeepSeek V4 expert geometry with unclamped SiLU, and
 DeepSeek V4.1 Flash (with its DSpark draft) with SiLU clamped at 10. Muse Spark
 and DeepSeek V4 checkpoints that declare a SiLU activation clamp are rejected,

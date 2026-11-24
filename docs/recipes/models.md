@@ -726,7 +726,7 @@ shapes and unsupported layouts retain the ordinary composed path. The fused
 sigmoid-bias top-k route supports the full scheduled token count.
 
 For Gluon Petit MegaMoE on one node with 8x gfx950 and MXFP4 expert weights,
-use attention DP8 and EP8, with at most 1024 tokens per rank:
+use attention DP8 and EP8:
 
 ```bash
 TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
@@ -1464,8 +1464,6 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve openai/gpt-oss-120b \
   --disable-autotune \
   --disable-kvstore
 ```
-
-This backend supports at most 1024 prefill or decode tokens per rank.
 
 ## DeepSeek V4.1-Flash
 

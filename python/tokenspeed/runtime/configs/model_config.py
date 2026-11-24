@@ -483,6 +483,150 @@ def _apply_beam_moe_default(model_config, server_args: ServerArgs) -> None:
         server_args.moe_backend = backend
 
 
+@dataclass(frozen=True)
+class PetitMoeShape:
+    num_experts: int
+    top_k: int
+    hidden_size: int
+    intermediate_size: int
+
+
+def _petit_shape_deepseek_v41(text: PretrainedConfig) -> PetitMoeShape:
+    return PetitMoeShape(
+        text.n_routed_experts,
+        text.num_experts_per_tok,
+        text.hidden_size,
+        text.moe_intermediate_size,
+    )
+
+
+def _petit_shape_kimi_k3(text: PretrainedConfig) -> PetitMoeShape:
+    # Latent MoE: routed experts run at routed_expert_hidden_size.
+    return PetitMoeShape(
+        text.num_experts,
+        text.num_experts_per_token,
+        (
+            text.routed_expert_hidden_size
+            if text.routed_expert_hidden_size is not None
+            else text.hidden_size
+        ),
+        text.moe_intermediate_size,
+    )
+
+
+def _petit_shape_muse_spark(text: PretrainedConfig) -> PetitMoeShape:
+    return PetitMoeShape(
+        text.num_local_experts,
+        text.num_experts_per_tok,
+        text.moe_hidden_size,
+        text.moe_intermediate_size,
+    )
+
+
+def _petit_shape_gpt_oss(text: PretrainedConfig) -> PetitMoeShape:
+    return PetitMoeShape(
+        text.num_local_experts,
+        text.num_experts_per_tok,
+        text.hidden_size,
+        text.intermediate_size,
+    )
+
+
+# Architectures that serve Gluon Petit, and the routed-expert shape each passes
+# to MoELayer. A model adds its architecture here when it serves Petit; the
+# weight preprocessor checks the built layers again.
+_PETIT_TARGET_SHAPES: dict[str, Callable[[PretrainedConfig], PetitMoeShape]] = {
+    "DeepseekV41ForCausalLM": _petit_shape_deepseek_v41,
+    "KimiK3ForConditionalGeneration": _petit_shape_kimi_k3,
+    "MuseSparkForConditionalGeneration": _petit_shape_muse_spark,
+    "GptOssForCausalLM": _petit_shape_gpt_oss,
+}
+
+
+def petit_moe_shapes(
+    model_config, speculative_algorithm: str | None
+) -> tuple[PetitMoeShape, ...] | None:
+    """The routed-expert shapes a Petit server builds for ``model_config``.
+
+    Returns the target's shape, then the DSpark draft's when it speculates with
+    DSpark (other drafts reuse the target's MoE); None for an architecture not
+    in ``_PETIT_TARGET_SHAPES``.
+    """
+    read = _PETIT_TARGET_SHAPES.get(resolve_architecture(model_config.hf_config))
+    if read is None:
+        return None
+    text = model_config.hf_text_config
+    shapes = (read(text),)
+    if speculative_algorithm == "DSPARK" and read is _petit_shape_deepseek_v41:
+        # DeepseekV41ForCausalLMDSpark swaps in the dspark_* expert counts.
+        shapes += (
+            PetitMoeShape(
+                text.dspark_n_routed_experts,
+                text.dspark_num_experts_per_tok,
+                text.hidden_size,
+                text.moe_intermediate_size,
+            ),
+        )
+    return shapes
+
+
+def _apply_gluon_petit_chunk(model_config, server_args: ServerArgs) -> None:
+    """Fit the prefill chunk to Gluon Petit's per-rank token capacity.
+
+    Petit's workspace holds the most tokens one rank feeds a forward, and its
+    heap fits a capacity that depends on the routed-expert shape. An unset
+    chunk is capped at the smallest capacity among the checkpoint's shapes; an
+    explicit chunk or a decode batch above it is refused. Runs before the
+    scheduler and the MoE layers read the chunk.
+    """
+    if server_args.all2all_backend != "gluon_petit" or not current_platform().is_cdna4:
+        return
+    from tokenspeed_kernel.ops.moe.gluon import gluon_petit_capacity
+
+    from tokenspeed.runtime.layers.moe.utils import decode_tokens_per_rank
+
+    shapes = petit_moe_shapes(model_config, server_args.speculative_algorithm)
+    ep_size = server_args.mapping.moe.ep_size
+    capacities = [
+        gluon_petit_capacity(
+            shape.num_experts,
+            shape.top_k,
+            shape.hidden_size,
+            shape.intermediate_size,
+            ep_size,
+        )
+        for shape in shapes or ()
+    ]
+    if not capacities or None in capacities:
+        # Not a Petit model, or not at this EP size: the weight preprocessor
+        # refuses the layer.
+        return
+    limit = min(capacities, key=lambda capacity: capacity.max_tokens_per_rank)
+    fits = (
+        f"Gluon Petit MegaMoE fits at most {limit.max_tokens_per_rank} tokens "
+        f"per rank for {limit.profile} at EP{ep_size}"
+    )
+    decode_tokens = decode_tokens_per_rank(
+        server_args.max_num_seqs,
+        server_args.mapping.attn.dp_size,
+        server_args.speculative_algorithm,
+        server_args.speculative_num_draft_tokens,
+    )
+    if decode_tokens > limit.max_tokens_per_rank:
+        raise ValueError(
+            f"{fits}; the decode batch needs {decode_tokens} per rank; reduce "
+            "--max-num-seqs"
+        )
+    if server_args._chunked_prefill_size_unset:
+        server_args.chunked_prefill_size = min(
+            server_args.chunked_prefill_size, limit.max_tokens_per_rank
+        )
+    elif server_args.chunked_prefill_size > limit.max_tokens_per_rank:
+        raise ValueError(
+            f"--chunked-prefill-size {server_args.chunked_prefill_size}: {fits}"
+        )
+
+
 def _beam_checkpoint_format(model_config) -> str | None:
     """``"bf16"`` without quantization, else the format ``beam_quant_policy``
     admits; None for a checkpoint Beam refuses, which keeps the MoE default
@@ -1118,6 +1262,8 @@ class ModelConfig:
             # After the checkpoint's quantization is known. A draft of Beam
             # resolves to BeamForCausalLMNextN and is not asked.
             _apply_beam_moe_default(self, server_args)
+        if server_args is not None and not is_draft_worker:
+            _apply_gluon_petit_chunk(self, server_args)
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()

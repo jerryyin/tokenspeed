@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
+    decode_tokens_per_rank,
     get_all2all_backend,
     get_deepep_mode,
     get_moe_backend,
@@ -389,6 +390,17 @@ class MoELayer(torch.nn.Module):
                     "Gluon Petit MegaMoE does not support nonstandard SiLU alpha"
                 )
             internal_activation_dtype = "mxfp4"
+            # Petit's workspace holds the most tokens one rank feeds a forward:
+            # its prefill chunk or its full decode batch.
+            persistent_max_num_tokens_per_gpu = max(
+                global_server_args_dict["chunked_prefill_size"],
+                decode_tokens_per_rank(
+                    global_server_args_dict["max_num_seqs"],
+                    mapping.attn.dp_size,
+                    global_server_args_dict["speculative_algorithm"],
+                    global_server_args_dict["speculative_num_draft_tokens"],
+                ),
+            )
 
         if input_dtype is None:
             input_dtype = torch.get_default_dtype()

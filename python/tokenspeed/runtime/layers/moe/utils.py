@@ -237,3 +237,17 @@ def get_deepep_mode() -> DeepEPMode:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
         DEEPEP_MODE = DeepEPMode.AUTO
     return DEEPEP_MODE
+
+
+def decode_tokens_per_rank(
+    max_num_seqs: int,
+    attn_dp_size: int,
+    speculative_algorithm: str | None,
+    speculative_num_draft_tokens: int | None,
+) -> int:
+    """Tokens one attention-DP rank feeds a full decode step: its share of
+    --max-num-seqs, each request at the speculative verify width."""
+    verify_tokens = (
+        speculative_num_draft_tokens if speculative_algorithm is not None else 1
+    )
+    return max_num_seqs // attn_dp_size * verify_tokens

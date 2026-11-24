@@ -86,6 +86,12 @@ class _MegaMoeTileShape(enum.IntEnum):
     n128 = 1
 
 
+# Per-rank token capacity: 32-row sorted-token blocks in solution-id bits 52-62.
+MEGA_MOE_SORTED_TOKEN_BLOCK = 32
+_MEGA_MOE_MAX_TOKENS_SHIFT = 52
+_MEGA_MOE_MAX_TOKEN_BLOCKS = 0x7FF
+
+
 class _MegaMoeProducerGeometry(enum.IntEnum):
     cta56 = 0
     cta64 = 1
@@ -134,6 +140,7 @@ def _make_mega_moe_solution_id(
         _FusedMoeActivationFunction.openai_swiglu
     ),
     has_bias: bool = True,
+    max_tokens_per_rank: int,
 ) -> int:
     activation_type = _FusedMoeDataType(activation_type)
     stages = _FusedMoeStages(stages)
@@ -160,6 +167,18 @@ def _make_mega_moe_solution_id(
     if inter_dim <= 0 or inter_dim % 512 or inter_dim // 512 > 32:
         raise ValueError(
             "MegaMoE inter_dim must be a positive 512 multiple at most 16384"
+        )
+    if (
+        max_tokens_per_rank <= 0
+        or max_tokens_per_rank % MEGA_MOE_SORTED_TOKEN_BLOCK
+        or max_tokens_per_rank // MEGA_MOE_SORTED_TOKEN_BLOCK
+        > _MEGA_MOE_MAX_TOKEN_BLOCKS
+    ):
+        raise ValueError(
+            "MegaMoE max_tokens_per_rank must be a positive multiple of "
+            f"{MEGA_MOE_SORTED_TOKEN_BLOCK} at most "
+            f"{_MEGA_MOE_MAX_TOKEN_BLOCKS * MEGA_MOE_SORTED_TOKEN_BLOCK}; "
+            f"got {max_tokens_per_rank}"
         )
     activation_function = _FusedMoeActivationFunction(activation_function)
     mfma = (
@@ -188,6 +207,10 @@ def _make_mega_moe_solution_id(
         | (int(w2_tile_shape) << 42)
         | ((inter_dim // 512 - 1) << 43)
         | (int(producer_geometry) << 48)
+        | (
+            max_tokens_per_rank // MEGA_MOE_SORTED_TOKEN_BLOCK
+            << _MEGA_MOE_MAX_TOKENS_SHIFT
+        )
     )
 
 
@@ -248,7 +271,8 @@ class MegaMoeConfig:
     stages: MegaMoeStages = MegaMoeStages.two_stage
     inter_dim: int = 3072
     has_bias: bool = True
-    max_tokens_per_rank: int = field(init=False, default=1024)
+    # Rows one rank may send per call; sizes the symmetric heap.
+    max_tokens_per_rank: int = field(kw_only=True)
     _solution_id: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -368,8 +392,11 @@ class MegaMoeConfig:
                     )
                 ),
                 has_bias=self.has_bias,
+                max_tokens_per_rank=self.max_tokens_per_rank,
             ),
         )
+        # Fail here, not at heap allocation, when the workspace cannot fit.
+        ops.mega_moe_workspace_info(0, self._solution_id)
 
     @property
     def compute_model_dim(self) -> int:

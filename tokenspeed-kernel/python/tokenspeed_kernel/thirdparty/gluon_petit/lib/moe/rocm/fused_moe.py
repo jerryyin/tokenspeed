@@ -162,6 +162,22 @@ class FusedMoESolutionId:
     def ProducerBlocks(self):
         return (56, 64, 128, 192)[self.ProducerGeometry()]
 
+    # MegaMoE per-rank token capacity, in 32-row sorted-token blocks.
+    kMegaMaxTokensShift: ClassVar[int] = 52
+    kMegaMaxTokensMask: ClassVar[int] = 0x7FF
+
+    def MaxTokensPerRank(self):
+        return (
+            (self.Repr() >> self.kMegaMaxTokensShift) & self.kMegaMaxTokensMask
+        ) * 32
+
+    def WithMaxTokensPerRank(self, max_tokens_per_rank):
+        mask = self.kMegaMaxTokensMask << self.kMegaMaxTokensShift
+        return self.FromRepr(
+            (self.Repr() & ~mask)
+            | (max_tokens_per_rank // 32 << self.kMegaMaxTokensShift)
+        )
+
     def Stage1TileShape(self):
         return FusedMoEStage1TileShape((self.Repr() >> 41) & 1)
 

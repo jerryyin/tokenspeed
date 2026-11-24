@@ -52,6 +52,9 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
         self.kLinear2Tiles = Config.kComputeHiddenSize // Config.kGroupN
         self.kStage1M = Config.kGroupM
         self.kTokenCountBits, self.kTokenCountMask = 17, (1 << 17) - 1
+        # Expert metadata packs the receive count below the block base.
+        assert Config.kNumRanks * Config.kMaxTokensPerRank <= self.kTokenCountMask
+        assert self.Workspace.kMaxPoolBlocks < 1 << (32 - self.kTokenCountBits)
         self.kExpertLaneMask = (1 << min(64, self.kNumExpertsPerRank)) - 1
 
     @device_method

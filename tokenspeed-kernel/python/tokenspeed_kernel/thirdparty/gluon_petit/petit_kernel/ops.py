@@ -1,5 +1,6 @@
 """Tensor MegaMoE bindings."""
 
+from lib.moe.rocm.mega_moe import GetMegaMoEWorkspaceInfo as mega_moe_workspace_info
 from lib.pybind.mega_moe import MegaMoe as mega_moe
 from lib.pybind.mega_moe import MegaMoeQuantizeMxFp4 as mega_moe_quantize_mxfp4
 from lib.pybind.mega_moe import (
